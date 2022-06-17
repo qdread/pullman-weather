@@ -24,3 +24,26 @@ ggplot(missing_byday) +
   theme(axis.title.x = element_blank())
 
 ggsave('project/figures/missing_value_trends.pdf')
+
+
+# Run lengths of missing values -------------------------------------------
+
+rle_na <- map_dfr(obs_vars, ~ do.call(cbind, c(variable = .x, rle(is.na(needed_raw_data[[.x]])))) |> as.data.table())
+rle_na <- rle_na[values == TRUE]
+rle_na[, lengths := as.integer(lengths)]
+
+ggplot(rle_na, aes(x = lengths)) +
+  geom_histogram(bins = 20) +
+  facet_wrap(~ variable) + scale_x_log10(name = 'run length of consecutive missing values') +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.01)))
+
+ggsave('project/figures/missing_value_runlength_loghistogram.pdf')
+
+# The majority of the runs are only 1 hour missing at once, followed by a few dozen with <10 hours missing, then around half a dozen with 20-30 hours missing,
+# then all variables have 2 places where about a week was missing, then the 3 runs of 3, 8, and 12 months missing.
+
+# Precipitation RLE:
+rle_precip <- rle(needed_raw_data$`PRCP.H-1 (in)` > 0)
+rle_precip <- data.table(length = rle_precip$lengths, any_precip = rle_precip$values)
+
+table(rle_precip[(any_precip)][['length']]) # Most precipitation events are 1 hour long but there are many that are longer.
