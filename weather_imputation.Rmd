@@ -18,7 +18,7 @@ This is a first attempt at imputing the weather data from Pullman (station ID 21
 I assumed that the variables other than precipitation (temperature, wind speed, relative humidity, and incoming shortwave radiation) are basically continuous so that short gaps can be interpolated using the neighboring values. Armed with that assumption, I did the following:
 
 - Take a five-hour rolling mean of each variable and use that to fill gaps of less than five consecutive hours, and fill the edges of any longer gap.
-- Calculate a "doubly-rolling" long-run average by day and hour by taking the values from +/- 2 hours on +/- 2 days from each day+hour combination, across all years in the dataset, and averaging them.
+- Calculate a "doubly-rolling" long-run average by day and hour by taking the values from +/- 2 days from each day+hour combination, across all years in the dataset, including either the observed data or data imputed in the previous step, and averaging them.
 - Fill any remaining gaps with the doubly-rolling values.
 
 ### Approach for precipitation
@@ -30,6 +30,255 @@ The approach for filling in precipitation gaps was the same regardless of the le
 
 ## Notes/caveats
 
+These are some issues with the current method and ideas for how it could be improved.
+
 - The imputation method I used, as I said above, is *ad hoc* and I came up with the thresholds of +/- 2 hours and days completely without any knowledge of whether that is a good idea. Those thresholds can easily be changed.
 - The precipitation imputation method uses random sampling so the imputed data is only one instance of that sampling. The uncertainty due to this is not incorporated into the results, but it could be if you run the sampling multiple times and run the model with a different imputed dataset each time. This may not be worth doing, though.
+- Because the imputed data uses long-run averages it is a little bit less noisy than the observed data. I can consider adding random noise to it to equal the noise in observed data, if you are interested in that.
 - Most of the missing data is in 3 large chunks that are about 3, 8, and 12 months long. Because the gaps are so long, the imputation is not very high-quality. A better way to do it would be to get data from a nearby weather station, find the relationship between it and the Pullman weather station data, and impute that way.
+
+\newpage
+
+## Initial data processing
+
+Load packages, read CSV files, and format dates and times consistently.
+
+```{r, eval = FALSE}
+library(data.table)
+library(purrr)
+library(glue)
+library(stringr)
+
+years <- 2014:2021
+
+# Files have different number of rows to skip 
+skip_n_scan <- c(2, 0, 4, 4, 4, 4, 4, 4)
+skip_n_solar <- c(2, 4, 4, 4, 4, 4, 4, 4)
+
+# Read data
+scan_raw <- map2(years, skip_n_scan, ~ fread(glue('project/weather_data/2198_SCAN_WATERYEAR={.x}.csv'), skip = .y)) 
+solar_raw <- map2(years, skip_n_solar, ~ fread(glue('project/weather_data/2198_SOLAR_WATERYEAR={.x}.csv'), skip = .y)) 
+
+# Convert Date column to Date format for all, if it is not already
+for (i in 1:8) {
+  if (!'Date' %in% class(scan_raw[[i]][['Date']])) {
+    scan_raw[[i]][, Date := as.Date(Date, format = '%m/%d/%Y')]
+  } else {
+    scan_raw[[i]][, Date := as.Date(Date)]
+  }
+  if (!'Date' %in% class(solar_raw[[i]][['Date']])) {
+    solar_raw[[i]][, Date := as.Date(Date, format = '%m/%d/%Y')]
+  } else {
+    solar_raw[[i]][, Date := as.Date(Date)]
+  }
+}
+
+scan_data <- rbindlist(scan_raw, fill = TRUE)
+solar_data <- rbindlist(solar_raw, fill = TRUE)
+
+# Get rid of bad column
+scan_data[, V32 := NULL]
+solar_data[, V5 := NULL]
+
+# Get rid of bad rows that all have 23:59 as the time
+scan_data <- scan_data[!Time %in% '23:59']
+solar_data <- solar_data[!Time %in% '23:59']
+
+# Some of the times are formatted differently from others. Make sure all are padded with 0 if hour has only 1 digit.
+scan_data[, Time := str_pad(Time, 5, pad = '0')]
+solar_data[, Time := str_pad(Time, 5, pad = '0')]
+```
+
+Join each year's data table together into one large table, create additional rows for the missing data, convert `-99.9` to `NA`, and keep only the needed variables.
+
+```{r, eval = FALSE}
+# Sort and set keys for each data table, then do a full join.
+setkey(scan_data, `Site Id`, Date, Time)
+setkey(solar_data, `Site Id`, Date, Time)
+
+unique_times <- unique(rbind(scan_data[,.(`Site Id`, Date, Time)], solar_data[, .(`Site Id`, Date, Time)]))
+
+all_raw_data <- scan_data[solar_data[unique_times]]
+
+# Create data.frame of all the dates and times with no gaps and join the data to it, to show how many are missing.
+date_range <- range(all_raw_data[['Date']])
+all_date_time <- CJ(Date = seq(from = date_range[1], to = date_range[2], by = 1), Time = glue('{sprintf("%02d", 0:23)}:00'))
+
+all_raw_data <- all_raw_data[all_date_time, on = .(Date, Time)]
+
+# Create data frame with only the desired variables
+needed_raw_data <- all_raw_data[, .(Date, Time, `TOBS.I-1 (degC)`, `WSPDX.H-1 (mph)`, `RHUM.I-1 (pct)`, `SRADV.H-1 (watt)`, `PRCP.H-1 (in)`)]
+
+obs_vars <- c('TOBS.I-1 (degC)', 'WSPDX.H-1 (mph)', 'RHUM.I-1 (pct)', 'SRADV.H-1 (watt)', 'PRCP.H-1 (in)')
+
+# Convert -99.9 codes to NA
+needed_raw_data[, (obs_vars) := lapply(.SD, function(x) ifelse(x == -99.9, as.numeric(NA), x)), .SDcols = obs_vars]
+```
+
+## Missing value imputation
+
+### Variables other than precipitation
+
+Take the rolling average over a five-hour window for the variables other than precipitation. Use these to impute the values for shorter time gaps.
+
+```{r, eval = FALSE}
+# Function with five hour moving window rolling mean 
+temp_roll <- frollmean(needed_raw_data$`TOBS.I-1 (degC)`, n = 5, align = 'center', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE)
+
+fivehour_roll <- function(x) frollmean(x, n = 5, align = 'center', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE)
+
+mean_vars <- obs_vars[1:4]
+
+data_fivehour_rollmean <- copy(needed_raw_data)
+data_fivehour_rollmean[, (mean_vars) := lapply(.SD, fivehour_roll), .SDcols = mean_vars]
+
+# Fill in the missing value only if needed
+data_fivehour_filled <- copy(needed_raw_data)
+for (v in mean_vars) {
+  data_fivehour_filled[[v]] <- ifelse(is.na(needed_raw_data[[v]]), data_fivehour_rollmean[[v]], needed_raw_data[[v]])
+}
+```
+
+Next, take the doubly-rolling long-run average over all years within +/- 2 days from each day, using either the observed data for that day-hour combination or the values imputed in the previous step if applicable.
+
+```{r, eval = FALSE}
+get_fiveday_mean <- function(Date, Time, ...) {
+  days_use <- Date + -2:2
+  m_d_t_use <- data.table(Month = month(days_use), Day = day(days_use), Time = Time)
+  data_use <- data_fivehour_filled[m_d_t_use, on = .(Month, Day, Time)]
+  data_use[, lapply(.SD, mean, na.rm = TRUE), .SDcols = mean_vars]
+}
+
+fiveday_means <- pmap(data_fivehour_filled, get_fiveday_mean) |> rbindlist()
+```
+
+### Precipitation
+
+For precipitation, regardless of the length of the missing run, we will randomly sample an hourly value from +/- 2 hours and +/- 2 days in the current year and all other years.
+
+```{r, eval = FALSE}
+random_precip_value <- function(Date, Time, ...) {
+  days_use <- Date + -2:2
+  hr <- as.numeric(substr(Time, 1, 2))
+  times_use <- str_pad(paste0(hr + -2:2, ':00'), width = 5, pad = '0')
+  m_d_t_use <- data.table(Month = month(days_use), Day = day(days_use))
+  m_d_t_use <- m_d_t_use[, .(Time = times_use), by = .(Month, Day)]
+  data_use <- data_fivehour_filled[m_d_t_use, on = .(Month, Day, Time)]
+  sample(na.omit(data_use[["PRCP.H-1 (in)"]]), size = 1)
+}
+
+set.seed(919)
+fiveday_precip <- pmap_dbl(data_fivehour_filled, random_precip_value)
+```
+
+### Filling in values
+
+Fill in all remaining missing values with the imputed values.
+
+```{r, eval = FALSE}
+data_all_filled <- copy(data_fivehour_filled)
+fiveday_means <- cbind(fiveday_means, `PRCP.H-1 (in)` = fiveday_precip)
+for (v in obs_vars) {
+  data_all_filled[[v]] <- ifelse(is.na(data_all_filled[[v]]), fiveday_means[[v]], data_all_filled[[v]])
+}
+```
+
+Calculate the longwave radiation column using the Stefan-Boltzmann law, `j = emissivity * sigma * (temp_C + 273.15)^4`, where `emissivity` is set at `0.9` (unitless), and `sigma` is the Stefan-Boltzmann constant `5.670374e-8 W m-2 K-4`.
+
+```{r, eval = FALSE}
+sigma <- 5.670374e-8
+emissivity <- 0.9
+data_all_filled[, `LWR (W m-2)` := emissivity * sigma * (`TOBS.I-1 (degC)` + 273.15)^4]
+```
+
+Create some flag columns saying which values were imputed and which were measured. LWR is considered imputed if temperature was imputed. Combine flags with imputed data and write to a file.
+
+```{r, eval = FALSE}
+imputation_flags <- needed_raw_data[, lapply(.SD, is.na), .SDcols = obs_vars]
+setnames(imputation_flags, paste0('imputed_', names(imputation_flags)))
+imputation_flags[, `imputed_LWR (W m-2)` := `imputed_TOBS.I-1 (degC)`]
+
+data_all_filled <- cbind(data_all_filled, imputation_flags)
+fwrite(data_all_filled, 'project/weather_data/data_all_imputed.csv')
+```
+
+Also write file in the DHSVM format. Order columns as required by the format, and remove headers. Swap location of precipitation and longwave columns. Convert windspeed units from mi/h to m/s, and precip units from in/h to m/h.
+
+```{r, eval = FALSE}
+datetime_formatted <- with(data_all_filled, paste(format(Date, '%m/%d/%Y'), substr(Time, 1, 2), sep = '-'))
+cols_use <- c(obs_vars[1:4], 'LWR (W m-2)', obs_vars[5])
+dhsvm_data <- data.table(DateTime = datetime_formatted, data_all_filled[, ..cols_use])
+
+dhsvm_data[, `PRCP.H-1 (in)` := `PRCP.H-1 (in)` * 0.0254]
+dhsvm_data[, `WSPDX.H-1 (mph)` := `WSPDX.H-1 (mph)` * 0.44704]
+
+fwrite(dhsvm_data, 'project/weather_data/dhsvm_forcing_imputed.txt', sep = ' ', quote = FALSE, col.names = FALSE)
+```
+
+\newpage
+
+## Visualization of imputation
+
+Here are some graphs of the observed and imputed data, colored by whether the data points were imputed (blue = observed, red = imputed). Alternating water years are shaded in gray and white for ease of reading.
+
+```{r, echo = FALSE}
+library(data.table)
+library(ggplot2)
+library(lubridate)
+
+theme_set(
+  theme_bw() +
+  theme(panel.grid = element_blank(),
+        strip.background = element_blank())
+)
+
+dat <- fread('project/weather_data/data_all_imputed.csv')
+dat[, datetime := as_datetime(paste(Date, Time), format = "%Y-%m-%d %H:%M", tz = "America/Chicago")]
+
+
+wateryear_shading <- data.frame(d_min = as_datetime(c('2013-10-01 00:01', '2015-10-01 00:01', '2017-10-01 00:01', '2019-10-01 00:01'), format = "%Y-%m-%d %H:%M", tz = "America/Chicago"),
+                                d_max = as_datetime(c('2014-09-30 23:59', '2016-09-30 23:59', '2018-09-30 23:59', '2020-09-30 23:59'), format = "%Y-%m-%d %H:%M", tz = "America/Chicago"))
+
+ggplot(dat) +
+  geom_rect(data = wateryear_shading, aes(xmin = d_min, xmax = d_max, ymin = -Inf, ymax = Inf), fill = 'gray75') +
+  geom_point(aes(x = datetime, y = `TOBS.I-1 (degC)`, color = `imputed_TOBS.I-1 (degC)`), size = 0.5, alpha = 0.5) +
+  theme(axis.title.x = element_blank(), legend.position = 'none') +
+  scale_color_brewer(palette = 'Set1', direction = -1) + 
+  ggtitle('Temperature')
+
+ggplot(dat) +
+  geom_rect(data = wateryear_shading, aes(xmin = d_min, xmax = d_max, ymin = -Inf, ymax = Inf), fill = 'gray75') +
+  geom_point(aes(x = datetime, y = `WSPDX.H-1 (mph)`, color = `imputed_WSPDX.H-1 (mph)`), size = 0.5, alpha = 0.5) +
+  theme(axis.title.x = element_blank(), legend.position = 'none') +
+  scale_color_brewer(palette = 'Set1', direction = -1) + 
+  ggtitle('Wind speed')
+
+ggplot(dat) +
+  geom_rect(data = wateryear_shading, aes(xmin = d_min, xmax = d_max, ymin = -Inf, ymax = Inf), fill = 'gray75') +
+  geom_point(aes(x = datetime, y = `RHUM.I-1 (pct)`, color = `imputed_RHUM.I-1 (pct)`), size = 0.5, alpha = 0.5) +
+  theme(axis.title.x = element_blank(), legend.position = 'none') +
+  scale_color_brewer(palette = 'Set1', direction = -1) + 
+  ggtitle('Relative humidity')
+
+ggplot(dat) +
+  geom_rect(data = wateryear_shading, aes(xmin = d_min, xmax = d_max, ymin = -Inf, ymax = Inf), fill = 'gray75') +
+  geom_point(aes(x = datetime, y = `SRADV.H-1 (watt)`, color = `imputed_SRADV.H-1 (watt)`), size = 0.5, alpha = 0.5) +
+  theme(axis.title.x = element_blank(), legend.position = 'none') +
+  scale_color_brewer(palette = 'Set1', direction = -1) + 
+  ggtitle('Incoming shortwave radiation')
+
+ggplot(dat) +
+  geom_rect(data = wateryear_shading, aes(xmin = d_min, xmax = d_max, ymin = -Inf, ymax = Inf), fill = 'gray75') +
+  geom_point(aes(x = datetime, y = `LWR (W m-2)`, color = `imputed_LWR (W m-2)`), size = 0.5, alpha = 0.5) +
+  theme(axis.title.x = element_blank(), legend.position = 'none') +
+  scale_color_brewer(palette = 'Set1', direction = -1) + 
+  ggtitle('Outgoing longwave radiation')
+
+ggplot(dat) +
+  geom_rect(data = wateryear_shading, aes(xmin = d_min, xmax = d_max, ymin = -Inf, ymax = Inf), fill = 'gray75') +
+  geom_point(aes(x = datetime, y = `PRCP.H-1 (in)`, color = `imputed_PRCP.H-1 (in)`), size = 0.5, alpha = 0.5) +
+  theme(axis.title.x = element_blank(), legend.position = 'none') +
+  scale_color_brewer(palette = 'Set1', direction = -1) + 
+  ggtitle('Precipitation')
+```
+
