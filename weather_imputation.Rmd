@@ -1,0 +1,35 @@
+---
+title: "Imputation of missing weather data"
+author: "Quentin D. Read"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+This is a first attempt at imputing the weather data from Pullman (station ID 2198) into a continuous series of hourly data points from 01 October 2013 to 30 September 2021. I describe the *ad hoc* imputation method that I invented to do this. All source code can be accessed at <https://github.com/qdread/pullman-weather>.
+
+## Brief description of the approach
+
+### Approach for all variables other than precipitation
+
+I assumed that the variables other than precipitation (temperature, wind speed, relative humidity, and incoming shortwave radiation) are basically continuous so that short gaps can be interpolated using the neighboring values. Armed with that assumption, I did the following:
+
+- Take a five-hour rolling mean of each variable and use that to fill gaps of less than five consecutive hours, and fill the edges of any longer gap.
+- Calculate a "doubly-rolling" long-run average by day and hour by taking the values from +/- 2 hours on +/- 2 days from each day+hour combination, across all years in the dataset, and averaging them.
+- Fill any remaining gaps with the doubly-rolling values.
+
+### Approach for precipitation
+
+The approach for filling in precipitation gaps was the same regardless of the length of the gap. It is not appropriate to use means to impute precipitation values because precipitation distribution is not remotely close to unimodal. It is skewed and consists of many 0s and a few positive values.
+
+- Get all non-missing precipitation values from +/- 2 hours on +/- 2 days, across all years in the dataset, for each day+hour combination.
+- For every missing precipitation value, randomly sample one value from the precipitation values generated in the previous step.
+
+## Notes/caveats
+
+- The imputation method I used, as I said above, is *ad hoc* and I came up with the thresholds of +/- 2 hours and days completely without any knowledge of whether that is a good idea. Those thresholds can easily be changed.
+- The precipitation imputation method uses random sampling so the imputed data is only one instance of that sampling. The uncertainty due to this is not incorporated into the results, but it could be if you run the sampling multiple times and run the model with a different imputed dataset each time. This may not be worth doing, though.
+- Most of the missing data is in 3 large chunks that are about 3, 8, and 12 months long. Because the gaps are so long, the imputation is not very high-quality. A better way to do it would be to get data from a nearby weather station, find the relationship between it and the Pullman weather station data, and impute that way.

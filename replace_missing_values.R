@@ -2,13 +2,6 @@
 
 source('initial_processing.R')
 
-library(lubridate)
-
-needed_raw_data[, Year := year(Date)]
-needed_raw_data[, Month := month(Date)]
-needed_raw_data[, Day := day(Date)]
-needed_raw_data[, Day_since_0 := as.numeric(Date)]
-
 # Function with five hour moving window rolling mean 
 temp_roll <- frollmean(needed_raw_data$`TOBS.I-1 (degC)`, n = 5, align = 'center', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE)
 
@@ -67,11 +60,30 @@ for (v in obs_vars) {
   data_all_filled[[v]] <- ifelse(is.na(data_all_filled[[v]]), fiveday_means[[v]], data_all_filled[[v]])
 }
 
+# Calculate the longwave radiation column using the Stefan-Boltzmann law
+# j = emissivity * sigma * (temp_C + 273.15)^4
+# where emissivity is set at 0.9 (unitless), and sigma is the Stefan-Boltzmann constant 5.670374e-8 W m-2 K-4 
+sigma <- 5.670374e-8
+emissivity <- 0.9
+data_all_filled[, `LWR (W m-2)` := emissivity * sigma * (`TOBS.I-1 (degC)` + 273.15)^4]
+
+# Make flags saying which values were imputed and which were measured. LWR is imputed if temperature is imputed.
 imputation_flags <- needed_raw_data[, lapply(.SD, is.na), .SDcols = obs_vars]
 setnames(imputation_flags, paste0('imputed_', names(imputation_flags)))
+imputation_flags[, `imputed_LWR (W m-2)` := `imputed_TOBS.I-1 (degC)`]
 
-data_all_filled[, c('Year', 'Month', 'Day', 'Day_since_0') := NULL]
-
+# Combine flags with imputed data and write to a file.
 data_all_filled <- cbind(data_all_filled, imputation_flags)
-
 fwrite(data_all_filled, 'project/weather_data/data_all_imputed.csv')
+
+# Also write file in the DHSVM format. Order columns as required by the format, and remove headers.
+# Swap location of precipitation and longwave columns.
+# Comvert windspeed units from mi/h to m/s, and precip units from in/h to m/h
+datetime_formatted <- with(data_all_filled, paste(format(Date, '%m/%d/%Y'), substr(Time, 1, 2), sep = '-'))
+cols_use <- c(obs_vars[1:4], 'LWR (W m-2)', obs_vars[5])
+dhsvm_data <- data.table(DateTime = datetime_formatted, data_all_filled[, ..cols_use])
+
+dhsvm_data[, `PRCP.H-1 (in)` := `PRCP.H-1 (in)` * 0.0254]
+dhsvm_data[, `WSPDX.H-1 (mph)` := `WSPDX.H-1 (mph)` * 0.44704]
+
+fwrite(dhsvm_data, 'project/weather_data/dhsvm_forcing_imputed.txt', sep = ' ', quote = FALSE, col.names = FALSE)
