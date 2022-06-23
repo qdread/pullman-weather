@@ -2,6 +2,7 @@ library(data.table)
 library(purrr)
 library(glue)
 library(stringr)
+library(lubridate)
 
 years <- 2014:2021
 
@@ -63,3 +64,8 @@ obs_vars <- c('TOBS.I-1 (degC)', 'WSPDX.H-1 (mph)', 'RHUM.I-1 (pct)', 'SRADV.H-1
 
 # Convert -99.9 codes to NA
 needed_raw_data[, (obs_vars) := lapply(.SD, function(x) ifelse(x == -99.9, as.numeric(NA), x)), .SDcols = obs_vars]
+
+# Add month, day, and time columns
+needed_raw_data[, Month := month(Date)]
+needed_raw_data[, Day := day(Date)]
+needed_raw_data[, Time := as.numeric(substr(Time, 1, 2))]
