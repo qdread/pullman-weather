@@ -1,0 +1,245 @@
+---
+title: "Gap filling with nearby weather stations"
+author: "Quentin D. Read"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+Here, I'm going to use the data from nearby weather stations that Zamir sent to try to fill in the larger gaps of the SCAN time series. The approach will be:
+
+- Fill in any small gaps of a few hours by linear interpolation for the continuous variables (temperature, wind speed, relative humidty, radiation, and soil moisture). Do not do this for precipitation because you cannot really interpolate as it is not really a "state" of the system.
+- Make a statistical model, as simple as possible, to correlate the weather variables from the SCAN time series with the other locations, for the times when they are overlapping.
+- Use this statistical relationship to predict the SCAN values for the times when we do have data from one or more nearby stations but not the SCAN time series.
+
+# Fill in the shorter gaps for variables other than precip
+
+Load the SCAN data and do initial processing.
+
+```{r}
+library(data.table)
+library(purrr)
+library(glue)
+library(stringr)
+library(lubridate)
+library(units)
+library(ggplot2)
+
+years <- 2014:2021
+
+# Files have different number of rows to skip 
+skip_n_scan <- c(2, 0, 4, 4, 4, 4, 4, 4)
+skip_n_solar <- c(2, 4, 4, 4, 4, 4, 4, 4)
+
+# Read data
+scan_raw <- map2(years, skip_n_scan, ~ fread(glue('project/weather_data/2198_SCAN_WATERYEAR={.x}.csv'), skip = .y)) 
+solar_raw <- map2(years, skip_n_solar, ~ fread(glue('project/weather_data/2198_SOLAR_WATERYEAR={.x}.csv'), skip = .y)) 
+
+# Convert Date column to Date format for all, if it is not already
+for (i in 1:8) {
+  if (!'Date' %in% class(scan_raw[[i]][['Date']])) {
+    scan_raw[[i]][, Date := as.Date(Date, format = '%m/%d/%Y')]
+  } else {
+    scan_raw[[i]][, Date := as.Date(Date)]
+  }
+  if (!'Date' %in% class(solar_raw[[i]][['Date']])) {
+    solar_raw[[i]][, Date := as.Date(Date, format = '%m/%d/%Y')]
+  } else {
+    solar_raw[[i]][, Date := as.Date(Date)]
+  }
+}
+
+scan_data <- rbindlist(scan_raw, fill = TRUE)
+solar_data <- rbindlist(solar_raw, fill = TRUE)
+
+# Get rid of bad column
+scan_data[, V32 := NULL]
+solar_data[, V5 := NULL]
+
+# Get rid of bad rows that all have 23:59 as the time
+scan_data <- scan_data[!Time %in% '23:59']
+solar_data <- solar_data[!Time %in% '23:59']
+
+# Some of the times are formatted differently from others. Make sure all are padded with 0 if hour has only 1 digit.
+scan_data[, Time := str_pad(Time, 5, pad = '0')]
+solar_data[, Time := str_pad(Time, 5, pad = '0')]
+```
+
+Join each year's data table together into one large table, create additional rows for the missing data, convert `-99.9` to `NA`, and keep only the needed variables.
+
+```{r}
+# Sort and set keys for each data table, then do a full join.
+setkey(scan_data, `Site Id`, Date, Time)
+setkey(solar_data, `Site Id`, Date, Time)
+
+unique_times <- unique(rbind(scan_data[,.(`Site Id`, Date, Time)], solar_data[, .(`Site Id`, Date, Time)]))
+
+all_raw_data <- scan_data[solar_data[unique_times]]
+
+# Create data.frame of all the dates and times with no gaps and join the data to it, to show how many are missing.
+date_range <- range(all_raw_data[['Date']])
+all_date_time <- CJ(Date = seq(from = date_range[1], to = date_range[2], by = 1), Time = glue('{sprintf("%02d", 0:23)}:00'))
+
+all_raw_data <- all_raw_data[all_date_time, on = .(Date, Time)]
+
+# Create data frame with only the desired variables
+needed_raw_data <- all_raw_data[, .(Date, Time, `TOBS.I-1 (degC)`, `WSPDX.H-1 (mph)`, `RHUM.I-1 (pct)`, `SRADV.H-1 (watt)`, `PRCP.H-1 (in)`)]
+
+obs_vars <- c('TOBS.I-1 (degC)', 'WSPDX.H-1 (mph)', 'RHUM.I-1 (pct)', 'SRADV.H-1 (watt)', 'PRCP.H-1 (in)')
+
+# Convert -99.9 codes to NA
+needed_raw_data[, (obs_vars) := lapply(.SD, function(x) ifelse(x == -99.9, as.numeric(NA), x)), .SDcols = obs_vars]
+
+# Add Month, Day, and Time columns
+needed_raw_data[, Month := month(Date)]
+needed_raw_data[, Day := day(Date)]
+needed_raw_data[, Time := as.numeric(substr(Time, 1, 2))]
+```
+
+Take the rolling average over a five-hour window for the variables other than precipitation. Use these to impute the values for shorter time gaps.
+
+```{r}
+# Function with five hour moving window rolling mean 
+temp_roll <- frollmean(needed_raw_data$`TOBS.I-1 (degC)`, n = 5, align = 'center', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE)
+
+fivehour_roll <- function(x) frollmean(x, n = 5, align = 'center', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE)
+
+mean_vars <- obs_vars[1:4]
+
+data_fivehour_rollmean <- copy(needed_raw_data)
+data_fivehour_rollmean[, (mean_vars) := lapply(.SD, fivehour_roll), .SDcols = mean_vars]
+
+# Fill in the missing value only if needed
+data_fivehour_filled <- copy(needed_raw_data)
+for (v in mean_vars) {
+  data_fivehour_filled[[v]] <- ifelse(is.na(needed_raw_data[[v]]), data_fivehour_rollmean[[v]], needed_raw_data[[v]])
+}
+```
+
+# Load and process the AWN and AMF weather time series
+
+Load all the auxiliary time series. Convert the date and time stamps to the same format as the SCAN time series. Select the appropriate columns and convert them to the same units as the SCAN time series (U.S. units) -- not strictly necessary but makes it easier to interpret. Use automated unit conversion for this. Note: solar radiation in SCAN is just in unit of W so it cannot be converted to W m<sup>-2</sup> without knowing the area.
+
+Coarsen the time resolution of the AWN and AMF time series. AWN is in 15-minute time steps and AMF in 30-minute time steps. A rolling average with resolution 4 (right aligned so we line up an hour with the measurements preceding it in time) is used to coarsen from 15 minutes to 60 minutes, and resolution 2 for 30 minutes to 60 minutes. (For precipitation, sum is used instead of mean.) Remove all time points that are not an exact multiple of an hour.
+
+```{r}
+awn_raw <- fread('project/weather_data/DHSVM_Pullman/Weather Data/AWN_15_300152.csv')
+amf_rc1_raw <- fread('project/weather_data/DHSVM_Pullman/Weather Data/AMF_US-RC1_BASE-BADM_2-5/AMF_US-RC1_BASE_HH_2-5.csv', skip = 2)
+amf_rc2_raw <- fread('project/weather_data/DHSVM_Pullman/Weather Data/AMF_US-RC2_BASE-BADM_2-5/AMF_US-RC2_BASE_HH_2-5.csv', skip = 2)
+
+units_options(set_units_mode = 'standard')
+convert_units <- function(x, old, new) as.numeric(set_units(set_units(x, old), new))
+
+### Process AWN
+
+# AWN missing values coded as 99999
+awn_raw[awn_raw == 99999] <- NA
+
+# Convert units for temperature (and average measurements 1 and 2)
+awn_raw[, air_temp_C := convert_units(apply(cbind(AIR_TEMP_F, SECOND_AIR_TEMP_F), 1, mean, na.rm = TRUE), 'degreeF', 'degreeC')]
+
+# Get only needed variables
+awn_subset <- awn_raw[, .(TSTAMP_PST, air_temp_C, `RELATIVE_HUMIDITY_%`, PRECIP_INCHES, WIND_SPEED_MPH, SOLAR_RAD_WM2)]
+awn_vars <- names(awn_subset)[-1]
+awn_cont_vars <- awn_vars[!awn_vars %in% 'PRECIP_INCHES']
+
+# Get rolling mean and sum
+awn_rollmean <- copy(awn_subset)
+awn_rollmean[, (awn_cont_vars) := lapply(.SD, frollmean, n = 4, align = 'right', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE), .SDcols = awn_cont_vars]
+awn_rollmean[, PRECIP_INCHES := frollsum(PRECIP_INCHES, n = 4, align = 'right', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE)]
+
+awn_rollmean[, Date := as.Date(TSTAMP_PST)]
+awn_rollmean[, Time := hour(TSTAMP_PST)]
+awn_rollmean[, Month := month(TSTAMP_PST)]
+awn_rollmean[, Day := day(TSTAMP_PST)]
+awn_rollmean[, Minute := minute(TSTAMP_PST)]
+
+awn_rollmean <- awn_rollmean[Minute == 0, .(Date, Time, Month, Day, air_temp_C, `RELATIVE_HUMIDITY_%`, PRECIP_INCHES, WIND_SPEED_MPH, SOLAR_RAD_WM2)]
+
+### PROCESS AMF
+# Note: currently only use RC1 because of issues with RC2 timestamp.
+
+# amf_rc1_raw[, station := 'RC1']
+# amf_rc2_raw[, station := 'RC2']
+# 
+# amf_raw <- rbindlist(list(amf_rc1_raw, amf_rc2_raw))
+
+# Missing value code is -9999
+amf_rc1_raw[amf_rc1_raw == -9999] <- NA
+
+# Convert units (wind speed m/s to mph, precip mm to in)
+amf_rc1_raw[, WS := convert_units(WS, 'm/s', 'mi/h')]
+amf_rc1_raw[, P := convert_units(P, 'mm', 'in')]
+
+# Convert timestamps to dates and times. Use END date. RC2 seems to have some issues.
+amf_rc1_raw[, Date := as.Date(substr(as.character(TIMESTAMP_END), 1, 8), format = '%Y%m%d')]
+amf_rc1_raw[, Time := as.numeric(substr(as.character(TIMESTAMP_END), 9, 10))]
+amf_rc1_raw[, Minute := as.numeric(substr(as.character(TIMESTAMP_END), 11, 12))]
+amf_rc1_raw[, Month := month(Date)]
+amf_rc1_raw[, Day := day(Date)]
+
+# Get only needed variables. PPFD is used for solar radiation because it does not look like SW is in there. 
+amf_rc1_subset <- amf_rc1_raw[, .(Date, Time, Month, Day, Minute, TA, WS, RH, PPFD_IN, P)]
+
+amf_vars <- c('TA', 'WS', 'RH', 'PPFD_IN', 'P')
+amf_cont_vars <- c('TA', 'WS', 'RH', 'PPFD_IN')
+
+# Get rolling mean and sum
+amf_rc1_rollmean <- copy(amf_rc1_subset)
+amf_rc1_rollmean[, (amf_cont_vars) := lapply(.SD, frollmean, n = 2, align = 'right', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE), .SDcols = amf_cont_vars]
+amf_rc1_rollmean[, P := frollsum(P, n = 2, align = 'right', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = FALSE)]
+
+amf_rc1_rollmean <- amf_rc1_rollmean[Minute == 0, .(Date, Time, Month, Day, TA, WS, RH, PPFD_IN, P)]
+```
+
+# Side-by-side comparison of time series
+
+Just for ease of plotting, take the daily min and max temp, the daily mean windspeed, the daily mean RH%, mean radiation, and total precipitation.
+
+```{r}
+SCAN_daily <- data_fivehour_filled[, .(T_min = min(`TOBS.I-1 (degC)`), T_max = max(`TOBS.I-1 (degC)`), WS = mean(`WSPDX.H-1 (mph)`), RH = mean(`RHUM.I-1 (pct)`), SR = mean(`SRADV.H-1 (watt)`), P = sum(`PRCP.H-1 (in)`)), by = .(Date, Month, Day)]
+
+AWN_daily <- awn_rollmean[, .(T_min = min(air_temp_C), T_max = max(air_temp_C), WS = mean(WIND_SPEED_MPH), RH = mean(`RELATIVE_HUMIDITY_%`), SR = mean(SOLAR_RAD_WM2), P = sum(PRECIP_INCHES)), by = .(Date, Month, Day)]
+
+AMFRC1_daily <- amf_rc1_rollmean[, .(T_min = min(TA), T_max = max(TA), WS = mean(WS), RH = mean(RH), SR = mean(PPFD_IN), P = sum(P)), by = .(Date, Month, Day)]
+
+# Make all longform and join
+date_vars <- c('Date', 'Month', 'Day')
+SCAN_daily_long <- melt(SCAN_daily, id.vars = date_vars)
+AWN_daily_long <- melt(AWN_daily, id.vars = date_vars)
+AMFRC1_daily_long <- melt(AMFRC1_daily, id.vars = date_vars)
+SCAN_daily_long[, time_series := 'SCAN']
+AWN_daily_long[, time_series := 'AWN']
+AMFRC1_daily_long[, time_series := 'AMF RC1']
+
+all_daily <- rbindlist(list(SCAN_daily_long, AWN_daily_long, AMFRC1_daily_long))
+```
+
+```{r}
+ggplot(all_daily, aes(x = Date, y = value, color = time_series)) +
+  geom_point(size = 0.25) +
+  facet_wrap(~ variable, scales = 'free_y')
+```
+
+Also make pairwise scatter plots for SCAN vs AMF and SCAN vs AWN. The y=x line is shown. It looks like the temperature of SCAN closely tracks AWN except that SCAN has slightly more "extreme" temperature where it tends to have lower minimum and higher maximum, but really only slightly, it has quite a bit higher average wind speed, RH and SR very similar, and P also pretty similar but maybe SCAN skews a tiny bit wetter. The exact slope of the relationship really doesn't matter as long as it is a reliable correlation which it certainly appears to be.
+
+```{r}
+all_daily_byTS <- dcast(all_daily, Date+Month+Day+variable ~ time_series)
+
+ggplot(all_daily_byTS, aes(x = SCAN, y = AWN)) +
+  geom_point(alpha = 0.25) +
+  geom_abline(slope = 1, intercept = 0, color = 'red') +
+  facet_wrap(~ variable, scales = 'free')
+```
+
+The Ameriflux is not as close as AWN but still pretty good. It looks like AMF has a warmer minimum temperature than SCAN, less wind, less humid, but maybe more precipitation. SR is probably the same but they are not in the same units thus why the red line does not line up.
+
+```{r}
+ggplot(all_daily_byTS, aes(x = SCAN, y = `AMF RC1`)) +
+  geom_point(alpha = 0.25) +
+  geom_abline(slope = 1, intercept = 0, color = 'red') +
+  facet_wrap(~ variable, scales = 'free')
+```
