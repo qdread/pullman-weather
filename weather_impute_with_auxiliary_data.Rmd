@@ -27,6 +27,12 @@ library(stringr)
 library(lubridate)
 library(units)
 library(ggplot2)
+library(Rutilitybelt)
+
+theme_set(theme_bw() + theme(
+  panel.grid = element_blank(),
+  strip.background = element_blank()
+))
 
 years <- 2014:2021
 
@@ -125,10 +131,12 @@ Load all the auxiliary time series. Convert the date and time stamps to the same
 
 Coarsen the time resolution of the AWN and AMF time series. AWN is in 15-minute time steps and AMF in 30-minute time steps. A rolling average with resolution 4 (right aligned so we line up an hour with the measurements preceding it in time) is used to coarsen from 15 minutes to 60 minutes, and resolution 2 for 30 minutes to 60 minutes. (For precipitation, sum is used instead of mean.) Remove all time points that are not an exact multiple of an hour.
 
+As of 19 July, we now have time series with correct time stamps for both AMF RC1 and AMF RC2.
+
 ```{r}
 awn_raw <- fread('project/weather_data/DHSVM_Pullman/Weather Data/AWN_15_300152.csv')
-amf_rc1_raw <- fread('project/weather_data/DHSVM_Pullman/Weather Data/AMF_US-RC1_BASE-BADM_2-5/AMF_US-RC1_BASE_HH_2-5.csv', skip = 2)
-amf_rc2_raw <- fread('project/weather_data/DHSVM_Pullman/Weather Data/AMF_US-RC2_BASE-BADM_2-5/AMF_US-RC2_BASE_HH_2-5.csv', skip = 2)
+amf_rc1_raw <- fread('project/weather_data/DHSVM_Pullman/Weather Data/AMF_US-RC1_BASE_HH_2-5.csv', skip = 2)
+amf_rc2_raw <- fread('project/weather_data/DHSVM_Pullman/Weather Data/AMF_US-RC2_BASE_HH_2-5.csv', skip = 2)
 
 units_options(set_units_mode = 'standard')
 convert_units <- function(x, old, new) as.numeric(set_units(set_units(x, old), new))
@@ -160,62 +168,94 @@ awn_rollmean[, Minute := minute(TSTAMP_PST)]
 awn_rollmean <- awn_rollmean[Minute == 0, .(Date, Time, Month, Day, air_temp_C, `RELATIVE_HUMIDITY_%`, PRECIP_INCHES, WIND_SPEED_MPH, SOLAR_RAD_WM2)]
 
 ### PROCESS AMF
-# Note: currently only use RC1 because of issues with RC2 timestamp.
+amf_rc1_raw[, station := 'RC1']
+amf_rc2_raw[, station := 'RC2']
 
-# amf_rc1_raw[, station := 'RC1']
-# amf_rc2_raw[, station := 'RC2']
-# 
-# amf_raw <- rbindlist(list(amf_rc1_raw, amf_rc2_raw))
+amf_raw <- rbindlist(list(amf_rc1_raw, amf_rc2_raw))
 
 # Missing value code is -9999
-amf_rc1_raw[amf_rc1_raw == -9999] <- NA
+amf_raw[amf_raw == -9999] <- NA
 
 # Convert units (wind speed m/s to mph, precip mm to in)
-amf_rc1_raw[, WS := convert_units(WS, 'm/s', 'mi/h')]
-amf_rc1_raw[, P := convert_units(P, 'mm', 'in')]
+amf_raw[, WS := convert_units(WS, 'm/s', 'mi/h')]
+amf_raw[, P := convert_units(P, 'mm', 'in')]
 
 # Convert timestamps to dates and times. Use END date. RC2 seems to have some issues.
-amf_rc1_raw[, Date := as.Date(substr(as.character(TIMESTAMP_END), 1, 8), format = '%Y%m%d')]
-amf_rc1_raw[, Time := as.numeric(substr(as.character(TIMESTAMP_END), 9, 10))]
-amf_rc1_raw[, Minute := as.numeric(substr(as.character(TIMESTAMP_END), 11, 12))]
-amf_rc1_raw[, Month := month(Date)]
-amf_rc1_raw[, Day := day(Date)]
+amf_raw[, Date := as.Date(substr(as.character(TIMESTAMP_END), 1, 8), format = '%Y%m%d')]
+amf_raw[, Time := as.numeric(substr(as.character(TIMESTAMP_END), 9, 10))]
+amf_raw[, Minute := as.numeric(substr(as.character(TIMESTAMP_END), 11, 12))]
+amf_raw[, Month := month(Date)]
+amf_raw[, Day := day(Date)]
 
 # Get only needed variables. PPFD is used for solar radiation because it does not look like SW is in there. 
-amf_rc1_subset <- amf_rc1_raw[, .(Date, Time, Month, Day, Minute, TA, WS, RH, PPFD_IN, P)]
+amf_subset <- amf_raw[, .(station, Date, Time, Month, Day, Minute, TA, WS, RH, PPFD_IN, P)]
 
 amf_vars <- c('TA', 'WS', 'RH', 'PPFD_IN', 'P')
 amf_cont_vars <- c('TA', 'WS', 'RH', 'PPFD_IN')
 
-# Get rolling mean and sum
-amf_rc1_rollmean <- copy(amf_rc1_subset)
+# Get rolling mean and sum. Do separately for RC1 and RC2
+amf_rc1_rollmean <- amf_subset[station == 'RC1']
 amf_rc1_rollmean[, (amf_cont_vars) := lapply(.SD, frollmean, n = 2, align = 'right', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE), .SDcols = amf_cont_vars]
 amf_rc1_rollmean[, P := frollsum(P, n = 2, align = 'right', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = FALSE)]
 
 amf_rc1_rollmean <- amf_rc1_rollmean[Minute == 0, .(Date, Time, Month, Day, TA, WS, RH, PPFD_IN, P)]
+
+amf_rc2_rollmean <- amf_subset[station == 'RC2']
+amf_rc2_rollmean[, (amf_cont_vars) := lapply(.SD, frollmean, n = 2, align = 'right', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE), .SDcols = amf_cont_vars]
+amf_rc2_rollmean[, P := frollsum(P, n = 2, align = 'right', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = FALSE)]
+
+amf_rc2_rollmean <- amf_rc2_rollmean[Minute == 0, .(Date, Time, Month, Day, TA, WS, RH, PPFD_IN, P)]
 ```
+
+Set the names in all the time series to be the same, as well as the order of the columns, for easier processing later. Write them to a file.
+
+```{r}
+setnames(data_fivehour_filled, c('Date', 'Time', 'T_degC', 'WS_mph', 'RH_pct', 'SR_in_Wm2', 'PRCP_in', 'Month', 'Day'))
+scan_ts <- data_fivehour_filled[, .(Date, Month, Day, Time, T_degC, WS_mph, RH_pct, SR_in_Wm2, PRCP_in)]
+
+setnames(awn_rollmean, c('Date', 'Time', 'Month', 'Day', 'T_degC', 'RH_pct', 'PRCP_in', 'WS_mph', 'SR_in_Wm2'))
+awn_ts <- awn_rollmean[, .(Date, Month, Day, Time, T_degC, WS_mph, RH_pct, SR_in_Wm2, PRCP_in)]
+
+setnames(amf_rc1_rollmean, c('Date', 'Time', 'Month', 'Day', 'T_degC', 'WS_mph', 'RH_pct', 'PPFD', 'PRCP_in'))
+amfrc1_ts <- amf_rc1_rollmean[, .(Date, Month, Day, Time, T_degC, WS_mph, RH_pct, PPFD, PRCP_in)]
+
+setnames(amf_rc2_rollmean, c('Date', 'Time', 'Month', 'Day', 'T_degC', 'WS_mph', 'RH_pct', 'PPFD', 'PRCP_in'))
+amfrc2_ts <- amf_rc2_rollmean[, .(Date, Month, Day, Time, T_degC, WS_mph, RH_pct, PPFD, PRCP_in)]
+```
+
+```{r, eval = FALSE}
+save(scan_ts, awn_ts, amfrc1_ts, amfrc2_ts, file = 'project/weather_data/4ts_intermediate.csv')
+```
+
 
 # Side-by-side comparison of time series
 
 Just for ease of plotting, take the daily min and max temp, the daily mean windspeed, the daily mean RH%, mean radiation, and total precipitation.
 
 ```{r}
-SCAN_daily <- data_fivehour_filled[, .(T_min = min(`TOBS.I-1 (degC)`), T_max = max(`TOBS.I-1 (degC)`), WS = mean(`WSPDX.H-1 (mph)`), RH = mean(`RHUM.I-1 (pct)`), SR = mean(`SRADV.H-1 (watt)`), P = sum(`PRCP.H-1 (in)`)), by = .(Date, Month, Day)]
+daily_summ <- function(ts) {
+  ts <- copy(ts)
+  if ("PPFD" %in% names(ts)) setnames(ts, 'PPFD', 'SR_in_Wm2')
+  ts[, .(T_min = min(T_degC), T_max = max(T_degC), WS = mean(WS_mph), RH = mean(RH_pct), SR = mean(SR_in_Wm2), P = sum(PRCP_in)), by = .(Date, Month, Day)]
+}
 
-AWN_daily <- awn_rollmean[, .(T_min = min(air_temp_C), T_max = max(air_temp_C), WS = mean(WIND_SPEED_MPH), RH = mean(`RELATIVE_HUMIDITY_%`), SR = mean(SOLAR_RAD_WM2), P = sum(PRECIP_INCHES)), by = .(Date, Month, Day)]
-
-AMFRC1_daily <- amf_rc1_rollmean[, .(T_min = min(TA), T_max = max(TA), WS = mean(WS), RH = mean(RH), SR = mean(PPFD_IN), P = sum(P)), by = .(Date, Month, Day)]
+SCAN_daily <- daily_summ(scan_ts)
+AWN_daily <- daily_summ(awn_ts)
+AMFRC1_daily <- daily_summ(amfrc1_ts)
+AMFRC2_daily <- daily_summ(amfrc2_ts)
 
 # Make all longform and join
 date_vars <- c('Date', 'Month', 'Day')
 SCAN_daily_long <- melt(SCAN_daily, id.vars = date_vars)
 AWN_daily_long <- melt(AWN_daily, id.vars = date_vars)
 AMFRC1_daily_long <- melt(AMFRC1_daily, id.vars = date_vars)
+AMFRC2_daily_long <- melt(AMFRC2_daily, id.vars = date_vars)
 SCAN_daily_long[, time_series := 'SCAN']
 AWN_daily_long[, time_series := 'AWN']
 AMFRC1_daily_long[, time_series := 'AMF RC1']
+AMFRC2_daily_long[, time_series := 'AMF RC2']
 
-all_daily <- rbindlist(list(SCAN_daily_long, AWN_daily_long, AMFRC1_daily_long))
+all_daily <- rbindlist(list(SCAN_daily_long, AWN_daily_long, AMFRC1_daily_long, AMFRC2_daily_long))
 ```
 
 ```{r}
@@ -235,7 +275,7 @@ ggplot(all_daily_byTS, aes(x = SCAN, y = AWN)) +
   facet_wrap(~ variable, scales = 'free')
 ```
 
-The Ameriflux is not as close as AWN but still pretty good. It looks like AMF has a warmer minimum temperature than SCAN, less wind, less humid, but maybe more precipitation. SR is probably the same but they are not in the same units thus why the red line does not line up.
+The Ameriflux RC1 is not as close as AWN but still pretty good. It looks like AMF has a warmer minimum temperature than SCAN, less wind, less humid, but maybe more precipitation. SR is probably the same but they are not in the same units thus why the red line does not line up. AMF RC2 is very similar to AMF RC1 but somewhat drier and windier.
 
 ```{r}
 ggplot(all_daily_byTS, aes(x = SCAN, y = `AMF RC1`)) +
@@ -243,3 +283,39 @@ ggplot(all_daily_byTS, aes(x = SCAN, y = `AMF RC1`)) +
   geom_abline(slope = 1, intercept = 0, color = 'red') +
   facet_wrap(~ variable, scales = 'free')
 ```
+
+```{r}
+ggplot(all_daily_byTS, aes(x = SCAN, y = `AMF RC2`)) +
+  geom_point(alpha = 0.25) +
+  geom_abline(slope = 1, intercept = 0, color = 'red') +
+  facet_wrap(~ variable, scales = 'free')
+```
+
+# Predictive model
+
+Now let's make predictive models for each weather variable to fill gaps in the time series. We will use a cross-validation approach to find the statistical model with the best predictive power for the overlapping sections, and then apply that to fill the gaps. 
+
+Start by joining the raw (non-summarized) data by date and time for each of the four time series. 
+
+```{r}
+id_vars <- c('Date','Month','Day','Time')
+scan_long <- melt(scan_ts, id.vars = id_vars, value.name = 'SCAN')
+awn_long <- melt(awn_ts, id.vars = id_vars, value.name = 'AWN')
+amfrc1_long <- melt(amfrc1_ts, id.vars = id_vars, value.name = 'AMFRC1')
+amfrc2_long <- melt(amfrc2_ts, id.vars = id_vars, value.name = 'AMFRC2')
+
+all_long <- Reduce(\(...) merge(..., all = TRUE), list(scan_long, awn_long, amfrc1_long, amfrc2_long))
+
+# Correct the PPFD and SR names
+all_long[variable %in% c('PPFD', 'SR_in_Wm2'), variable := 'SR_in_Wm2']
+```
+
+Now that we have the data ready, we can fit a very basic model. I think for imputation purposes it is fine to ignore covariation between the different weather variables, as well as temporal autocorrelation, as long as we can get adequate predictive power. Let's just use AWN for imputation and see how well it does on the data we have. If it is not good enough, we can bring in the AMF datasets, or try more sophisticated methods.
+
+Apply relevant transformations to some of the variables.
+
+```{r}
+simple_scan_awn_fits <- group_nest_dt(all_long, variable)
+simple_scan_awn_fits[, fit := map(data, ~ lm(SCAN ~ AWN, data = .))]
+```
+
