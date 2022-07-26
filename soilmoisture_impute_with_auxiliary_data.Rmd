@@ -1,0 +1,146 @@
+---
+title: "Soil moisture time series imputation"
+author: "Quentin D. Read"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+In this document, I will read in and process the auxiliary soil moisture data from nearby sensors that we can use to impute SCAN time series data. We will use a combination of the covariance between soil moisture at different depths in the existing SCAN dataset, and correlation between SCAN and the other sensors, to impute missing values in the SCAN time series.
+
+First, read in the SCAN data. Interpolate the small gaps in the same way as we have done for the other datasets.
+
+```{r}
+library(data.table)
+library(purrr)
+library(glue)
+library(stringr)
+library(lubridate)
+library(units)
+library(ggplot2)
+library(Rutilitybelt)
+
+theme_set(theme_bw() + theme(
+  panel.grid = element_blank(),
+  strip.background = element_blank()
+))
+
+years <- 2014:2021
+
+# Files have different number of rows to skip 
+skip_n_scan <- c(2, 0, 4, 4, 4, 4, 4, 4)
+skip_n_solar <- c(2, 4, 4, 4, 4, 4, 4, 4)
+
+# Read data
+scan_raw <- map2(years, skip_n_scan, ~ fread(glue('project/weather_data/2198_SCAN_WATERYEAR={.x}.csv'), skip = .y)) 
+solar_raw <- map2(years, skip_n_solar, ~ fread(glue('project/weather_data/2198_SOLAR_WATERYEAR={.x}.csv'), skip = .y)) 
+
+# Convert Date column to Date format for all, if it is not already
+for (i in 1:8) {
+  if (!'Date' %in% class(scan_raw[[i]][['Date']])) {
+    scan_raw[[i]][, Date := as.Date(Date, format = '%m/%d/%Y')]
+  } else {
+    scan_raw[[i]][, Date := as.Date(Date)]
+  }
+  if (!'Date' %in% class(solar_raw[[i]][['Date']])) {
+    solar_raw[[i]][, Date := as.Date(Date, format = '%m/%d/%Y')]
+  } else {
+    solar_raw[[i]][, Date := as.Date(Date)]
+  }
+}
+
+scan_data <- rbindlist(scan_raw, fill = TRUE)
+solar_data <- rbindlist(solar_raw, fill = TRUE)
+
+# Get rid of bad column
+scan_data[, V32 := NULL]
+solar_data[, V5 := NULL]
+
+# Get rid of bad rows that all have 23:59 as the time
+scan_data <- scan_data[!Time %in% '23:59']
+solar_data <- solar_data[!Time %in% '23:59']
+
+# Some of the times are formatted differently from others. Make sure all are padded with 0 if hour has only 1 digit.
+scan_data[, Time := str_pad(Time, 5, pad = '0')]
+solar_data[, Time := str_pad(Time, 5, pad = '0')]
+```
+
+Join each year's data table together into one large table, create additional rows for the missing data, convert `-99.9` to `NA`, and keep only the needed variables.
+
+```{r}
+# Sort and set keys for each data table, then do a full join.
+setkey(scan_data, `Site Id`, Date, Time)
+setkey(solar_data, `Site Id`, Date, Time)
+
+unique_times <- unique(rbind(scan_data[,.(`Site Id`, Date, Time)], solar_data[, .(`Site Id`, Date, Time)]))
+
+all_raw_data <- scan_data[solar_data[unique_times]]
+
+# Create data.frame of all the dates and times with no gaps and join the data to it, to show how many are missing.
+date_range <- range(all_raw_data[['Date']])
+all_date_time <- CJ(Date = seq(from = date_range[1], to = date_range[2], by = 1), Time = glue('{sprintf("%02d", 0:23)}:00'))
+
+all_raw_data <- all_raw_data[all_date_time, on = .(Date, Time)]
+
+# Create data frame with only the desired variables
+sm_names <- grep('^SMS', names(all_raw_data), value = TRUE)
+soilmoisture_raw_data <- all_raw_data[, mget(c('Date', 'Time', sm_names))]
+
+# Convert -99.9 codes to NA
+soilmoisture_raw_data[, (sm_names) := lapply(.SD, function(x) ifelse(x == -99.9, as.numeric(NA), x)), .SDcols = sm_names]
+
+# Add Month, Day, and Time columns
+soilmoisture_raw_data[, Month := month(Date)]
+soilmoisture_raw_data[, Day := day(Date)]
+soilmoisture_raw_data[, Time := as.numeric(substr(Time, 1, 2))]
+```
+
+Take the rolling average over a five-hour window for all soil moisture variables. Use these to impute the values for shorter time gaps.
+
+```{r}
+# Function with five hour moving window rolling mean 
+fivehour_roll <- function(x) frollmean(x, n = 5, align = 'center', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE)
+
+soilmoisture_fivehour_rollmean <- copy(soilmoisture_raw_data)
+soilmoisture_fivehour_rollmean[, (sm_names) := lapply(.SD, fivehour_roll), .SDcols = sm_names]
+
+# Fill in the missing value only if needed
+soilmoisture_fivehour_filled <- copy(soilmoisture_raw_data)
+for (v in sm_names) {
+  soilmoisture_fivehour_filled[[v]] <- ifelse(is.na(soilmoisture_raw_data[[v]]), soilmoisture_fivehour_rollmean[[v]], soilmoisture_raw_data[[v]])
+}
+```
+
+# Load and process CAF soil moisture time series
+
+It is very clean and requires no processing. Missing values are already coded as NA.
+
+```{r}
+caf_soil_dir <- 'project/weather_data/DHSVM_Pullman/Soil Moisture Data/caf_sensors/Hourly'
+caf_filenames <- dir(caf_soil_dir, pattern = '*.txt', full.names = TRUE)
+
+caf_soilmoisture <- rbindlist(map(caf_filenames, fread))
+caf_soilmoisture[, Date := mdy(Date)]
+```
+
+Average everything by location, removing missing values. Exclude anything before 2013-10-01.
+
+```{r}
+caf_sm_cols <- grep('^VW', names(caf_soilmoisture), value = TRUE)
+caf_soilmoisture_avg <- caf_soilmoisture[Date >= '2013-10-01', lapply(.SD, mean, na.rm = TRUE), by = .(Date, Time), .SDcols = caf_sm_cols]
+```
+
+Plot daily averages. There are no missing values, but we only have data through 2016-06-15 so we will not be able to impute any of the large gaps in the SCAN dataset (the first gap already extends past June 2016).
+
+```{r}
+caf_daily_averages <- caf_soilmoisture_avg[, lapply(.SD, mean), by = .(Date), .SDcols = caf_sm_cols]
+caf_daily_long <- melt(caf_daily_averages, id.vars = 'Date', variable.name = 'depth', value.name = 'VWC')
+
+ggplot(caf_daily_long, aes(x = Date, y = VWC, color = depth)) +
+  geom_line(size = 1, alpha = 0.5) +
+  scale_color_brewer(palette = 'Set1')
+```
+

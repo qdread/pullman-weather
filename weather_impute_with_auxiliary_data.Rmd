@@ -27,6 +27,8 @@ library(stringr)
 library(lubridate)
 library(units)
 library(ggplot2)
+library(caret)
+library(gt)
 library(Rutilitybelt)
 
 theme_set(theme_bw() + theme(
@@ -109,8 +111,6 @@ Take the rolling average over a five-hour window for the variables other than pr
 
 ```{r}
 # Function with five hour moving window rolling mean 
-temp_roll <- frollmean(needed_raw_data$`TOBS.I-1 (degC)`, n = 5, align = 'center', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE)
-
 fivehour_roll <- function(x) frollmean(x, n = 5, align = 'center', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE)
 
 mean_vars <- obs_vars[1:4]
@@ -224,7 +224,7 @@ amfrc2_ts <- amf_rc2_rollmean[, .(Date, Month, Day, Time, T_degC, WS_mph, RH_pct
 ```
 
 ```{r, eval = FALSE}
-save(scan_ts, awn_ts, amfrc1_ts, amfrc2_ts, file = 'project/weather_data/4ts_intermediate.csv')
+save(scan_ts, awn_ts, amfrc1_ts, amfrc2_ts, file = 'project/weather_data/4ts_intermediate.RData')
 ```
 
 
@@ -312,10 +312,93 @@ all_long[variable %in% c('PPFD', 'SR_in_Wm2'), variable := 'SR_in_Wm2']
 
 Now that we have the data ready, we can fit a very basic model. I think for imputation purposes it is fine to ignore covariation between the different weather variables, as well as temporal autocorrelation, as long as we can get adequate predictive power. Let's just use AWN for imputation and see how well it does on the data we have. If it is not good enough, we can bring in the AMF datasets, or try more sophisticated methods.
 
-Apply relevant transformations to some of the variables.
+Apply relevant transformations to some of the variables. Use 10-fold cross-validation to train the model.
+
+## Temperature
+
+First let's try temperature. Compare how well each of the three time series do when used as predictors of SCAN in the 10-fold cross-validated linear model.
 
 ```{r}
-simple_scan_awn_fits <- group_nest_dt(all_long, variable)
-simple_scan_awn_fits[, fit := map(data, ~ lm(SCAN ~ AWN, data = .))]
+temp_awn_fit <- train(
+  form = SCAN ~ AWN,
+  data = all_long[variable == 'T_degC' & !is.na(SCAN) & !is.na(AWN)],
+  method = 'lm',
+  trControl = trainControl(method = 'cv', number = 10)
+)
+
+temp_amf1_fit <- train(
+  form = SCAN ~ AMFRC1,
+  data = all_long[variable == 'T_degC' & !is.na(SCAN) & !is.na(AMFRC1)],
+  method = 'lm',
+  trControl = trainControl(method = 'cv', number = 10)
+)
+
+temp_amf2_fit <- train(
+  form = SCAN ~ AMFRC2,
+  data = all_long[variable == 'T_degC' & !is.na(SCAN) & !is.na(AMFRC2)],
+  method = 'lm',
+  trControl = trainControl(method = 'cv', number = 10)
+)
 ```
 
+```{r, echo = FALSE}
+temp_results <- data.frame(predictor = c('AWN', 'AMF RC1', 'AMF RC2'), 
+                           Rsquared = c(temp_awn_fit$results$Rsquared, temp_amf1_fit$results$Rsquared, temp_amf2_fit$results$Rsquared),
+                           RMSE = c(temp_awn_fit$results$RMSE, temp_amf1_fit$results$RMSE, temp_amf2_fit$results$RMSE))
+
+gt(temp_results) %>%
+  fmt_number(columns = c(Rsquared, RMSE), n_sigfig = 3)
+```
+
+The cross-validated AWN prediction has a higher R-squared and is "wrong" by an average of 1.5 degrees C versus >2.5 for the Ameriflux predictions. So, we will just go with the AWN prediction. I am just going to use AWN for all the other variables and not even try the Ameriflux.
+
+## Wind speed
+
+Because wind speed is non-negative, we cannot just do a linear model assuming a normally distributed response variable because the predictions could then be negative. We also cannot just do a log transformation because of the zero values. First, let's just try to do a `log(x+0.1)` transformation and then see what we get. Also round the result in post-processing.
+
+```{r}
+ws_dat <- all_long[variable == 'WS_mph' & !is.na(SCAN) & !is.na(AWN)]
+ws_dat[, SCAN_tr := log(SCAN + 0.01)]
+ws_dat[, AWN_tr := log(AWN + 0.01)]
+
+ws_awn_fit <- train(
+  form = SCAN_tr ~ AWN_tr,
+  data = ws_dat,
+  method = 'lm',
+  trControl = trainControl(method = 'cv', number = 10)
+)
+```
+
+
+## Relative humidity
+
+This one is annoying because relative humidity is between 0 and 1. We have some values of exactly 1 (100% RH) but no values of exactly 0. There are about 1000 values with 100% RH in the SCAN time series. We will just get around it by subtracting 0.1 from the RH values and doing a logit transformation, predicting, then back-transforming.
+
+```{r}
+rh_dat <- all_long[variable == 'RH_pct' & !is.na(SCAN) & !is.na(AWN)]
+rh_dat[, SCAN_tr := qlogis(SCAN/100 - 0.001)]
+rh_dat[, AWN_tr := qlogis(AWN/100 - 0.001)]
+
+rh_awn_fit <- train(
+  form = SCAN_tr ~ AWN_tr,
+  data = rh_dat,
+  method = 'lm',
+  trControl = trainControl(method = 'cv', number = 10)
+)
+```
+
+
+## Solar radiation
+
+```{r}
+sr_dat <- all_long[variable == 'SR_in_Wm2' & !is.na(SCAN) & !is.na(AWN)]
+sr_dat[, SCAN_tr := log(SCAN + 0.01)]
+sr_dat[, AWN_tr := log(AWN + 0.01)]
+
+sr_awn_fit <- train(
+  form = SCAN_tr ~ AWN_tr,
+  data = sr_dat,
+  method = 'lm',
+  trControl = trainControl(method = 'cv', number = 10)
+)
+```
