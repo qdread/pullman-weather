@@ -44,7 +44,7 @@ fit_rf <- function(variable, data, lower_bound, upper_bound, predictors, ...) {
   
   rf_control <- trainControl(method = 'cv', number = 10, 
                              allowParallel = TRUE, verboseIter = TRUE, 
-                             prediction_bounds = c(lower_bound, upper_bound))
+                             predictionBounds = c(lower_bound, upper_bound))
   
   train(
     form = as.formula(paste('SCAN ~', paste(predictors, collapse = '+'))),
