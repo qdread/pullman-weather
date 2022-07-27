@@ -293,7 +293,7 @@ ggplot(all_daily_byTS, aes(x = SCAN, y = `AMF RC2`)) +
 
 # Predictive model
 
-Now let's make predictive models for each weather variable to fill gaps in the time series. We will use a cross-validation approach to find the statistical model with the best predictive power for the overlapping sections, and then apply that to fill the gaps. 
+Now let's make predictive models for each weather variable to fill gaps in the time series. We will train a random forest model on the portion of the dataset where the SCAN and the other data series overlap. We will use 10-fold cross-validation approach to find the model with the best predictive power for the overlapping sections. Finally we will apply that model to fill the gaps, predicting the time points when there are no SCAN values but there are values from the other time series.
 
 Start by joining the raw (non-summarized) data by date and time for each of the four time series. 
 
@@ -310,34 +310,42 @@ all_long <- Reduce(\(...) merge(..., all = TRUE), list(scan_long, awn_long, amfr
 all_long[variable %in% c('PPFD', 'SR_in_Wm2'), variable := 'SR_in_Wm2']
 ```
 
-Now that we have the data ready, we can fit a very basic model. I think for imputation purposes it is fine to ignore covariation between the different weather variables, as well as temporal autocorrelation, as long as we can get adequate predictive power. Let's just use AWN for imputation and see how well it does on the data we have. If it is not good enough, we can bring in the AMF datasets, or try more sophisticated methods.
-
-Apply relevant transformations to some of the variables. Use 10-fold cross-validation to train the model.
+Now that we have the data ready, we can fit a very basic model. I think for imputation purposes it is fine to ignore covariation between the different weather variables, as well as temporal autocorrelation, as long as we can get adequate predictive power. 
 
 ## Temperature
 
-First let's try temperature. Compare how well each of the three time series do when used as predictors of SCAN in the 10-fold cross-validated linear model.
+First, for temperature, let's try AWN alone, AMF RC1 alone, AMF RC2 alone, and all three. Compare how well each of the three time series do (and all three together) when used as predictors of SCAN in the 10-fold cross-validated random forest model. All default tuning parameters are used for the random forest. If it turns out that predictions are unsatisfactory we can modify that. Parallel processing is enabled too.
 
 ```{r}
+set.seed(7272)
+rf_control_nobound <- trainControl(method = 'cv', number = 10, verboseIter = TRUE)
+
 temp_awn_fit <- train(
   form = SCAN ~ AWN,
   data = all_long[variable == 'T_degC' & !is.na(SCAN) & !is.na(AWN)],
-  method = 'lm',
-  trControl = trainControl(method = 'cv', number = 10)
+  method = 'rf',
+  trControl = rf_control_nobound
 )
 
 temp_amf1_fit <- train(
   form = SCAN ~ AMFRC1,
   data = all_long[variable == 'T_degC' & !is.na(SCAN) & !is.na(AMFRC1)],
-  method = 'lm',
-  trControl = trainControl(method = 'cv', number = 10)
+  method = 'rf',
+  trControl = rf_control_nobound
 )
 
 temp_amf2_fit <- train(
   form = SCAN ~ AMFRC2,
   data = all_long[variable == 'T_degC' & !is.na(SCAN) & !is.na(AMFRC2)],
-  method = 'lm',
-  trControl = trainControl(method = 'cv', number = 10)
+  method = 'rf',
+  trControl = rf_control_nobound
+)
+
+temp_all3_fit <- train(
+  form = SCAN ~ AWN + AMFRC1 + AMFRC2,
+  data = all_long[variable == 'T_degC' & !is.na(SCAN) & !is.na(AMFRC2)],
+  method = 'rf',
+  trControl = rf_control_nobound
 )
 ```
 
@@ -351,6 +359,12 @@ gt(temp_results) %>%
 ```
 
 The cross-validated AWN prediction has a higher R-squared and is "wrong" by an average of 1.5 degrees C versus >2.5 for the Ameriflux predictions. So, we will just go with the AWN prediction. I am just going to use AWN for all the other variables and not even try the Ameriflux.
+
+```{r}
+temp_pred_IS <- round(predict(temp_awn_fit), 1)
+temp_pred_OS <- round(predict(temp_awn_fit, newdata = all_long[variable == 'T_degC' & !is.na(AWN)]), 1)
+```
+
 
 ## Wind speed
 
@@ -367,6 +381,9 @@ ws_awn_fit <- train(
   method = 'lm',
   trControl = trainControl(method = 'cv', number = 10)
 )
+
+ws_pred_IS <- round(exp(predict(ws_awn_fit)) - 0.01, 1)
+ws_pred_OS <- round(predict(ws_awn_fit, newdata = all_long[variable == 'WS_mph' & !is.na(AWN)]), 1)
 ```
 
 
@@ -385,10 +402,14 @@ rh_awn_fit <- train(
   method = 'lm',
   trControl = trainControl(method = 'cv', number = 10)
 )
+
+rh_pred_IS <- round(100 * plogis(predict(rh_awn_fit) + 0.001), 0)
 ```
 
 
 ## Solar radiation
+
+Again we have a non-negative value. Sometimes it can be exactly zero, but obviously otherwise always positive. We do a log transformation with a small amount added before modeling.
 
 ```{r}
 sr_dat <- all_long[variable == 'SR_in_Wm2' & !is.na(SCAN) & !is.na(AWN)]
@@ -402,3 +423,7 @@ sr_awn_fit <- train(
   trControl = trainControl(method = 'cv', number = 10)
 )
 ```
+
+## Precipitation
+
+This is a difficult one because of the large number of zero values.
