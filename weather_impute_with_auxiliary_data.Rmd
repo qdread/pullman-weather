@@ -12,10 +12,11 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 Here, I'm going to use the data from nearby weather stations that Zamir sent to try to fill in the larger gaps of the SCAN time series. The approach will be:
 
 - Fill in any small gaps of a few hours by linear interpolation for the continuous variables (temperature, wind speed, relative humidity, radiation, and soil moisture). Do not do this for precipitation because you cannot really interpolate as it is not really a "state" of the system.
-- Make a statistical model, as simple as possible, to correlate the weather variables from the SCAN time series with the other locations, for the times when they are overlapping.
-- Use this statistical relationship to predict the SCAN values for the times when we do have data from one or more nearby stations but not the SCAN time series.
+- Train random forest models to correlate the weather variables from the SCAN time series with one or more of the other locations, for the times when they are overlapping.
+- Compare the models for each variable to show which locations are the best predictors for the overlapping portion, selecting the best one.
+- Use the best model to predict the SCAN values for the times when we do have data from one or more nearby stations but not the SCAN time series.
 
-# Fill in the shorter gaps for variables other than precip
+# Fill in the shorter gaps for variables other than precipitation
 
 Load the SCAN data and do initial processing.
 
@@ -35,7 +36,9 @@ theme_set(theme_bw() + theme(
   panel.grid = element_blank(),
   strip.background = element_blank()
 ))
+```
 
+```{r, eval = FALSE}
 years <- 2014:2021
 
 # Files have different number of rows to skip 
@@ -78,7 +81,7 @@ solar_data[, Time := str_pad(Time, 5, pad = '0')]
 
 Join each year's data table together into one large table, create additional rows for the missing data, convert `-99.9` to `NA`, and keep only the needed variables.
 
-```{r}
+```{r, eval = FALSE}
 # Sort and set keys for each data table, then do a full join.
 setkey(scan_data, `Site Id`, Date, Time)
 setkey(solar_data, `Site Id`, Date, Time)
@@ -109,7 +112,7 @@ needed_raw_data[, Time := as.numeric(substr(Time, 1, 2))]
 
 Take the rolling average over a five-hour window for the variables other than precipitation. Use these to impute the values for shorter time gaps.
 
-```{r}
+```{r, eval = FALSE}
 # Function with five hour moving window rolling mean 
 fivehour_roll <- function(x) frollmean(x, n = 5, align = 'center', fill = NA, algo = 'exact', hasNA = TRUE, na.rm = TRUE)
 
@@ -133,7 +136,7 @@ Coarsen the time resolution of the AWN and AMF time series. AWN is in 15-minute 
 
 As of 19 July, we now have time series with correct time stamps for both AMF RC1 and AMF RC2.
 
-```{r}
+```{r, eval = FALSE}
 awn_raw <- fread('project/weather_data/DHSVM_Pullman/Weather Data/AWN_15_300152.csv')
 amf_rc1_raw <- fread('project/weather_data/DHSVM_Pullman/Weather Data/AMF_US-RC1_BASE_HH_2-5.csv', skip = 2)
 amf_rc2_raw <- fread('project/weather_data/DHSVM_Pullman/Weather Data/AMF_US-RC2_BASE_HH_2-5.csv', skip = 2)
@@ -209,7 +212,7 @@ amf_rc2_rollmean <- amf_rc2_rollmean[Minute == 0, .(Date, Time, Month, Day, TA, 
 
 Set the names in all the time series to be the same, as well as the order of the columns, for easier processing later. Write them to a file.
 
-```{r}
+```{r, eval = FALSE}
 setnames(data_fivehour_filled, c('Date', 'Time', 'T_degC', 'WS_mph', 'RH_pct', 'SR_in_Wm2', 'PRCP_in', 'Month', 'Day'))
 scan_ts <- data_fivehour_filled[, .(Date, Month, Day, Time, T_degC, WS_mph, RH_pct, SR_in_Wm2, PRCP_in)]
 
@@ -221,9 +224,7 @@ amfrc1_ts <- amf_rc1_rollmean[, .(Date, Month, Day, Time, T_degC, WS_mph, RH_pct
 
 setnames(amf_rc2_rollmean, c('Date', 'Time', 'Month', 'Day', 'T_degC', 'WS_mph', 'RH_pct', 'PPFD', 'PRCP_in'))
 amfrc2_ts <- amf_rc2_rollmean[, .(Date, Month, Day, Time, T_degC, WS_mph, RH_pct, PPFD, PRCP_in)]
-```
 
-```{r, eval = FALSE}
 save(scan_ts, awn_ts, amfrc1_ts, amfrc2_ts, file = 'project/weather_data/4ts_intermediate.RData')
 ```
 
@@ -233,6 +234,8 @@ save(scan_ts, awn_ts, amfrc1_ts, amfrc2_ts, file = 'project/weather_data/4ts_int
 Just for ease of plotting, take the daily min and max temp, the daily mean windspeed, the daily mean RH%, mean radiation, and total precipitation.
 
 ```{r}
+load('project/weather_data/4ts_intermediate.RData')
+
 daily_summ <- function(ts) {
   ts <- copy(ts)
   if ("PPFD" %in% names(ts)) setnames(ts, 'PPFD', 'SR_in_Wm2')
@@ -263,6 +266,8 @@ ggplot(all_daily, aes(x = Date, y = value, color = time_series)) +
   geom_point(size = 0.25) +
   facet_wrap(~ variable, scales = 'free_y')
 ```
+
+This plot shows us that we will not be able to use the auxiliary data to impute anything in a time period from late 2019 through part of 2020 where there are no time series. We will need to use the *ad hoc* method I developed earlier for that.
 
 Also make pairwise scatter plots for SCAN vs AMF and SCAN vs AWN. The y=x line is shown. It looks like the temperature of SCAN closely tracks AWN except that SCAN has slightly more "extreme" temperature where it tends to have lower minimum and higher maximum, but really only slightly, it has quite a bit higher average wind speed, RH and SR very similar, and P also pretty similar but maybe SCAN skews a tiny bit wetter. The exact slope of the relationship really doesn't matter as long as it is a reliable correlation which it certainly appears to be.
 
@@ -295,11 +300,37 @@ ggplot(all_daily_byTS, aes(x = SCAN, y = `AMF RC2`)) +
 
 Now let's make predictive models for each weather variable to fill gaps in the time series. We will train a random forest model on the portion of the dataset where the SCAN and the other data series overlap. We will use 10-fold cross-validation approach to find the model with the best predictive power for the overlapping sections. Finally we will apply that model to fill the gaps, predicting the time points when there are no SCAN values but there are values from the other time series.
 
+## Fit the models
+
 *note*: This portion of the code was run on SciNet.
 
-Start by joining the raw (non-summarized) data by date and time for each of the four time series. 
+The random forest models are done separately for each weather variable. I think for imputation purposes it is fine to ignore covariation between the different weather variables, as well as temporal autocorrelation, as long as we can get adequate predictive power. 
 
-```{r}
+I fit four random forest models for each of the five weather variables. One uses AWN only to predict, one uses AMF RC1 only, one uses AMF RC2 only, and one uses all three. Obviously more variables is better because the cross-validation will discourage overfitting, but the random forest model does not handle missing values so we can only use a smaller dataset for the model with more variables. 
+
+For each variable, I set the prediction bounds appropriately. For example, wind speed predicted values could not be negative, and relative humidity predicted values had to be between 0 and 100.
+
+Below is the script that was run in parallel on Ceres. This all ran in about 2 hours but was fitting many models simultaneously.
+
+```{r, eval = FALSE}
+library(data.table)
+library(purrr)
+library(furrr)
+library(caret)
+library(Rutilitybelt)
+
+plan(multicore(workers = as.numeric(Sys.getenv('SLURM_NTASKS'))))
+task <- as.numeric(Sys.getenv('SLURM_ARRAY_TASK_ID'))
+pred_name <- c('AWN', 'AMFRC1', 'AMFRC2', 'all')[task]
+pred_list <- list('AWN', 'AMFRC1', 'AMFRC2', c('AWN', 'AMFRC1', 'AMFRC2'))[[task]]
+
+load('project/weather_data/4ts_intermediate.RData') # loads time series.
+
+# Rename PPFD to SR_in_Wm2 for Ameriflux
+setnames(amfrc1_ts, old = 'PPFD', new = 'SR_in_Wm2')
+setnames(amfrc2_ts, old = 'PPFD', new = 'SR_in_Wm2')
+
+# Join all data together
 id_vars <- c('Date','Month','Day','Time')
 scan_long <- melt(scan_ts, id.vars = id_vars, value.name = 'SCAN')
 awn_long <- melt(awn_ts, id.vars = id_vars, value.name = 'AWN')
@@ -308,124 +339,227 @@ amfrc2_long <- melt(amfrc2_ts, id.vars = id_vars, value.name = 'AMFRC2')
 
 all_long <- Reduce(\(...) merge(..., all = TRUE), list(scan_long, awn_long, amfrc1_long, amfrc2_long))
 
-# Correct the PPFD and SR names
-all_long[variable %in% c('PPFD', 'SR_in_Wm2'), variable := 'SR_in_Wm2']
+rf_fits <- group_nest_dt(all_long, variable)
+
+# Set prediction bounds and number of decimal places to round in post-processing for all the variables
+prediction_bounds <- data.table(
+  variable = c('T_degC', 'WS_mph', 'RH_pct', 'PRCP_in', 'SR_in_Wm2'),
+  lower_bound = c(NA, 0, 0, 0, 0),
+  upper_bound = c(NA, NA, 100, NA, NA),
+  n_decimal = c(1, 1, 0, 2, 2)
+)
+
+rf_fits <- rf_fits[prediction_bounds, on = 'variable']
+
+# function to fit random forest model for a particular dataset (variable) and predictors
+fit_rf <- function(variable, data, lower_bound, upper_bound, predictors, ...) {
+  data_fit <- data[, mget(c('SCAN', predictors))]
+  data_fit <- data_fit[complete.cases(data_fit)]
+  
+  rf_control <- trainControl(method = 'cv', number = 10, 
+                             allowParallel = TRUE, verboseIter = TRUE, 
+                             predictionBounds = c(lower_bound, upper_bound))
+  
+  train(
+    form = as.formula(paste('SCAN ~', paste(predictors, collapse = '+'))),
+    data = data_fit,
+    method = 'rf',
+    trControl = rf_control
+  )
+}
+
+# Apply the function with the predictor(s) for this array task
+rf_fits[, fit := future_pmap(rf_fits, fit_rf, predictors = pred_list)]
+rf_fits[, predict_insample := map(fit, predict)]
+rf_fits[, predict_outsample := map2(fit, data, ~ predict(.x, newdata = .y))]
+
+# Additional post-processing can be done locally later.
+saveRDS(rf_fits, file = paste0('project/weather_data/rf_fits', pred_name, '.rds'))
 ```
 
-Now that we have the data ready, we can fit a very basic model. I think for imputation purposes it is fine to ignore covariation between the different weather variables, as well as temporal autocorrelation, as long as we can get adequate predictive power. 
+## Post-processing of output
 
-## Temperature
+Next, I did some post-processing, also on Ceres, to combine the model fit statistics into a table and the predicted values into a large data frame, that I downloaded to work with locally.
 
-First, for temperature, let's try AWN alone, AMF RC1 alone, AMF RC2 alone, and all three. Compare how well each of the three time series do (and all three together) when used as predictors of SCAN in the 10-fold cross-validated random forest model. All default tuning parameters are used for the random forest. If it turns out that predictions are unsatisfactory we can modify that. Parallel processing is enabled too.
+```{r, eval = FALSE}
+library(data.table)
+library(caret)
+library(purrr)
+library(glue)
 
-```{r}
-set.seed(7272)
-rf_control_nobound <- trainControl(method = 'cv', number = 10, verboseIter = TRUE)
+pred_names <- c('AWN', 'AMFRC1', 'AMFRC2', 'all')
+pred_list <- list('AWN', 'AMFRC1', 'AMFRC2', c('AWN', 'AMFRC1', 'AMFRC2'))
 
-temp_awn_fit <- train(
-  form = SCAN ~ AWN,
-  data = all_long[variable == 'T_degC' & !is.na(SCAN) & !is.na(AWN)],
-  method = 'rf',
-  trControl = rf_control_nobound
+fits <- map(pred_names, ~ readRDS(glue('project/weather_data/rf_fits{.}.rds'))) # Load objects
+
+# Get summary information on final fit quality
+fit_summaries <- cbind(
+  expand.grid(variable = fits[[1]][['variable']], predictors = pred_names),
+  map_dfr(fits, \(fitdt) map_dfr(fitdt[['fit']], \(fit) fit[['results']][fit[['results']][['mtry']] == fit[['bestTune']][1,1], ]))
 )
 
-temp_amf1_fit <- train(
-  form = SCAN ~ AMFRC1,
-  data = all_long[variable == 'T_degC' & !is.na(SCAN) & !is.na(AMFRC1)],
-  method = 'rf',
-  trControl = rf_control_nobound
-)
+# Create data frame of complete cases that were used for out of sample prediction in each case
+walk(1:4, \(i) {
+  vars <- pred_list[[i]]
+  data_subset <- map(fits[[i]][['data']], \(dat) dat[complete.cases(dat[, ..vars])])
+  fits[[i]][, data_subset := data_subset]
+})
 
-temp_amf2_fit <- train(
-  form = SCAN ~ AMFRC2,
-  data = all_long[variable == 'T_degC' & !is.na(SCAN) & !is.na(AMFRC2)],
-  method = 'rf',
-  trControl = rf_control_nobound
-)
+# Combine all predicted values together for each fit type, rounding appropriately
+make_pred_data <- function(variable, n_decimal, data_subset, predict_outsample, ...) {
+  y_pred <- round(predict_outsample, n_decimal)
+  cbind(data.table(variable = variable, y_pred = y_pred), data_subset)
+}
 
-temp_all3_fit <- train(
-  form = SCAN ~ AWN + AMFRC1 + AMFRC2,
-  data = all_long[variable == 'T_degC' & !is.na(SCAN) & !is.na(AMFRC2)],
-  method = 'rf',
-  trControl = rf_control_nobound
-)
+all_pred_list <- map(fits, \(fit) pmap_dfr(fit, make_pred_data))
+
+# Put everything into single data.table and write to CSV
+all_pred_dt <- map2_dfr(pred_names, all_pred_list, ~ data.table(predictors = .x, .y))
+all_pred_dt[, c('SCAN', 'AWN', 'AMFRC1', 'AMFRC2') := NULL]
+
+fwrite(all_pred_dt, 'project/weather_data/rf_all_pred.csv')
+fwrite(fit_summaries, 'project/weather_data/rf_fit_summaries.csv')
 ```
+
+## Look at fit statistics
+
+Here are some fit statistics. The root mean squared error (RMSE) for each variable is in the data units. For example, the random forest model using only AWN as a predictor was wrong, on average, by 1.63 degrees C, for the out-of-sample predictions of each cross-validation fold. The R-squared is another measure of the model fit. It is the cross-validation R-squared so it appropriately accounts for overfitting.
+
+The table tells us that the best prediction accuracy (highest cross-validated R-squared and lowest cross-validated RMSE) was achieved using either the AWN time series alone (for temperature and humidity), or a combination of all three (for wind speed, solar radiation, and precipitation). The accuracy for precipitation and wind speed is not as good as for the other variables but the R-squared values are well over 0.8 in both cases so I think that is good enough.
+
+Unfortunately, though, the Ameriflux data do not exist for some of the data gaps. So we will have to use the model based on AWN for those gaps.
 
 ```{r, echo = FALSE}
-temp_results <- data.frame(predictor = c('AWN', 'AMF RC1', 'AMF RC2'), 
-                           Rsquared = c(temp_awn_fit$results$Rsquared, temp_amf1_fit$results$Rsquared, temp_amf2_fit$results$Rsquared),
-                           RMSE = c(temp_awn_fit$results$RMSE, temp_amf1_fit$results$RMSE, temp_amf2_fit$results$RMSE))
+fit_summaries <- fread('project/weather_data/rf_fit_summaries.csv')
 
-gt(temp_results) %>%
-  fmt_number(columns = c(Rsquared, RMSE), n_sigfig = 3)
+gt(fit_summaries[, .(variable, predictors, RMSE, Rsquared)], groupname_col = 'variable') %>%
+  fmt_number(c(RMSE, Rsquared), n_sigfig = 3) %>%
+  tab_options(
+    row_group.background.color = "#D4EBF2",
+    row_group.font.weight = 'bold',
+    column_labels.font.weight = 'bold'
+  )
 ```
 
-The cross-validated AWN prediction has a higher R-squared and is "wrong" by an average of 1.5 degrees C versus >2.5 for the Ameriflux predictions. So, we will just go with the AWN prediction. I am just going to use AWN for all the other variables and not even try the Ameriflux.
+# Combine raw and imputed data
+
+Now let's put together the raw data with the data imputed from the random forest model.
+
+We have to do some "wrangling" to fill the data gaps with the predicted values from the random forest model. Use the AWN model for temperature and humidity for all time gaps, the all-predictors model for wind speed, radiation, and precipitation for the older time gap, and the AWN model for all for the newer time gaps where the all-predictors model does not have predicted values. Also there are some small gaps in the all-predictors model for wind speed for 2015 and 2016 which we can fill with the AWN model.
+
+This gets us to a pretty good place where we have everything filled in up to the gap from 2019-2020 where there are no 
 
 ```{r}
-temp_pred_IS <- round(predict(temp_awn_fit), 1)
-temp_pred_OS <- round(predict(temp_awn_fit, newdata = all_long[variable == 'T_degC' & !is.na(AWN)]), 1)
+load('project/weather_data/4ts_intermediate.RData') # loads time series.
+rf_all_pred <- fread('project/weather_data/rf_all_pred.csv')
+
+# Get the predictions for the AWN and all time series and make it a wide form.
+rf_pred_wide <- dcast(rf_all_pred[predictors %in% c('AWN', 'all')],
+                      Date + Month + Day + Time + variable ~ predictors, value.var = 'y_pred')
+
+# SCAN time series to long form
+id_vars <- c('Date','Month','Day','Time')
+scan_filled <- melt(scan_ts, id.vars = id_vars, value.name = 'SCAN')
+
+# Join observed and predicted data
+scan_filled[rf_pred_wide, on = .NATURAL, `:=` (SCAN_pred_AWN = i.AWN, SCAN_pred_all = i.all)]
+            
+# Fill gap with the logic described above
+scan_filled[variable %in% c('T_degC', 'RH_pct') | Date > '2016-09-30', SCAN_filled := ifelse(!is.na(SCAN), SCAN, SCAN_pred_AWN)]
+scan_filled[variable %in% c('WS_mph', 'PRCP_in', 'SR_in_Wm2') & Date <= '2016-09-30', SCAN_filled := ifelse(!is.na(SCAN), SCAN, ifelse(!is.na(SCAN_pred_all), SCAN_pred_all, SCAN_pred_AWN))]
 ```
 
+# Fill in the remaining gaps with ad hoc method
 
-## Wind speed
+This is what we need to do to fill in the 2019-2020 gap.
 
-Because wind speed is non-negative, we cannot just do a linear model assuming a normally distributed response variable because the predictions could then be negative. We also cannot just do a log transformation because of the zero values. First, let's just try to do a `log(x+0.1)` transformation and then see what we get. Also round the result in post-processing.
+First take the doubly-rolling long-run average over all years within +/- 2 days from each day, using either the observed data for that day-hour combination or the values imputed by the "short gap" filling method if applicable.
 
 ```{r}
-ws_dat <- all_long[variable == 'WS_mph' & !is.na(SCAN) & !is.na(AWN)]
-ws_dat[, SCAN_tr := log(SCAN + 0.01)]
-ws_dat[, AWN_tr := log(AWN + 0.01)]
+get_fiveday_mean <- function(Date, Time, ...) {
+  days_use <- Date + -2:2
+  m_d_t_use <- data.table(Month = month(days_use), Day = day(days_use), Time = Time)
+  data_use <- scan_ts[m_d_t_use, on = .(Month, Day, Time)]
+  data_use[, lapply(.SD, mean, na.rm = TRUE), .SDcols = mean_vars]
+}
 
-ws_awn_fit <- train(
-  form = SCAN_tr ~ AWN_tr,
-  data = ws_dat,
-  method = 'lm',
-  trControl = trainControl(method = 'cv', number = 10)
-)
+mean_vars <- c('T_degC', 'WS_mph', 'RH_pct', 'SR_in_Wm2')
+fiveday_means <- pmap(scan_ts, get_fiveday_mean) |> rbindlist()
+```
 
-ws_pred_IS <- round(exp(predict(ws_awn_fit)) - 0.01, 1)
-ws_pred_OS <- round(predict(ws_awn_fit, newdata = all_long[variable == 'WS_mph' & !is.na(AWN)]), 1)
+## Add noise to variables other than precipitation
+
+Now add noise to the imputed data using my ad hoc procedure. The general procedure is to exploit the identity that the variance of the sum of two uncorrelated normally distributed variables is the sum of their two variances. Thus we can generate Gaussian noise  $N \sim \textbf{Normal}(0, \sigma_{N})$ with $\sigma_{N} = \sqrt{\sigma^2_{observed} - \sigma^2_{imputed}}$, then add it to the imputed data, and it will have the same variance as the observed data. For temperature, this works as is. For relative humidity which ranges from 0% to 100%, we have to divide the observed data by 100 then logit-transform, to get it to approximate a normal distribution that you can add normal noise to. Add the noise then back-transform. I thought a similar approach would work with a log transformation of wind speed (it has a lower bound of 0 and appears to be roughly lognormally distributed) but I think the formula for noise standard deviation is invalid in this case so I manually tweaked the noise until it gave passable results. I did not modify shortwave radiation with noise, because it already seemed to have similar variability to the observed data without adding any more noise.
+
+```{r, eval = FALSE}
+fiveday_means_withnoise <- copy(fiveday_means)
+
+fiveday_means_withnoise[, WS_mph := log(WS_mph)]
+fiveday_means_withnoise[, RH_pct := qlogis(RH_pct/100)]
+
+dat_observed <- scan_ts[, ..mean_vars]
+
+dat_observed[, WS_mph := log(WS_mph)]
+dat_observed[, RH_pct := qlogis(RH_pct/100)]
+
+var_imputed <- sapply(fiveday_means_withnoise, var, na.rm = TRUE)
+var_observed <- sapply(dat_observed, \(x) var(x[is.finite(x)], na.rm = TRUE))
+sd_noise <- sqrt(var_observed - var_imputed)
+
+# Apply a ballpark standard deviation to the wind speed variable, calculated by hand
+sd_noise[2] <- 0.4
+
+set.seed(410)
+noise <- sapply(sd_noise, \(sd) rnorm(n = nrow(fiveday_means), mean = 0, sd = sd))
+# No noise added to shortwave radiation: set to zero
+noise[, 'SR_in_Wm2'] <- 0
+
+# Add noise and back-transform, setting any remaining negative values to zero
+fiveday_means_withnoise <- fiveday_means_withnoise + noise
+fiveday_means_withnoise[, WS_mph := exp(WS_mph)]
+fiveday_means_withnoise[, RH_pct := plogis(RH_pct) * 100]
+
+# Round the imputed data to the same number of decimal places as the original data
+fiveday_means_withnoise[, T_degC := round(T_degC, 1)]
+fiveday_means_withnoise[, WS_mph := round(WS_mph, 1)]
+fiveday_means_withnoise[, RH_pct := round(RH_pct, 0)]
+fiveday_means_withnoise[, SR_in_Wm2 := round(SR_in_Wm2, 2)]
 ```
 
 
-## Relative humidity
+## Sample values from appropriate times for precipitation
 
-This one is annoying because relative humidity is between 0 and 1. We have some values of exactly 1 (100% RH) but no values of exactly 0. There are about 1000 values with 100% RH in the SCAN time series. We will just get around it by subtracting 0.1 from the RH values and doing a logit transformation, predicting, then back-transforming.
+For precipitation, regardless of the length of the missing run, we will randomly sample an hourly value from +/- 2 hours and +/- 2 days in the current year and all other years.
 
-```{r}
-rh_dat <- all_long[variable == 'RH_pct' & !is.na(SCAN) & !is.na(AWN)]
-rh_dat[, SCAN_tr := qlogis(SCAN/100 - 0.001)]
-rh_dat[, AWN_tr := qlogis(AWN/100 - 0.001)]
+```{r, eval = FALSE}
+random_precip_value <- function(Date, Time, ...) {
+  days_use <- Date + -2:2
+  hr <- as.numeric(substr(Time, 1, 2))
+  times_use <- (hr + -2:2) %% 24
+  m_d_t_use <- data.table(Month = month(days_use), Day = day(days_use))
+  m_d_t_use <- m_d_t_use[, .(Time = times_use), by = .(Month, Day)]
+  data_use <- scan_ts[m_d_t_use, on = .(Month, Day, Time)]
+  sample(na.omit(data_use[["PRCP_in"]]), size = 1)
+}
 
-rh_awn_fit <- train(
-  form = SCAN_tr ~ AWN_tr,
-  data = rh_dat,
-  method = 'lm',
-  trControl = trainControl(method = 'cv', number = 10)
-)
-
-rh_pred_IS <- round(100 * plogis(predict(rh_awn_fit) + 0.001), 0)
+set.seed(919)
+fiveday_precip <- pmap_dbl(scan_ts, random_precip_value)
 ```
 
+## Fill in any remaining gaps
 
-## Solar radiation
+Fill in all remaining missing values with the imputed values.
 
-Again we have a non-negative value. Sometimes it can be exactly zero, but obviously otherwise always positive. We do a log transformation with a small amount added before modeling.
+```{r, eval = FALSE}
+fiveday_means_combined <- cbind(fiveday_means_withnoise, PRCP_in = fiveday_precip)
+for (v in obs_vars) {
+  scan_filled[[v]] <- ifelse(is.na(scan_filled[[v]]), fiveday_means_combined[[v]], scan_filled[[v]])
+}
 
-```{r}
-sr_dat <- all_long[variable == 'SR_in_Wm2' & !is.na(SCAN) & !is.na(AWN)]
-sr_dat[, SCAN_tr := log(SCAN + 0.01)]
-sr_dat[, AWN_tr := log(AWN + 0.01)]
-
-sr_awn_fit <- train(
-  form = SCAN_tr ~ AWN_tr,
-  data = sr_dat,
-  method = 'lm',
-  trControl = trainControl(method = 'cv', number = 10)
-)
 ```
 
-## Precipitation
+# Plot the results
 
-This is a difficult one because of the large number of zero values.
+Plot the time series colored by the source of the data. Blue is the actual data from the SCAN time series (not imputed), green is data imputed for very short gaps using linear interpolation (good quality imputation), pink is data imputed with nearby weather stations (good quality imputation), and orange is data imputed with my *ad hoc* method where no nearby weather stations were available (probably poor quality imputation).
+
+In my opinion it all passes the eyeball test.

@@ -28,7 +28,7 @@ walk(1:4, \(i) {
 # Combine all predicted values together for each fit type, rounding appropriately
 make_pred_data <- function(variable, n_decimal, data_subset, predict_outsample, ...) {
   y_pred <- round(predict_outsample, n_decimal)
-  cbind(data.table(variable = variable, y_pred = predict_outsample), data_subset)
+  cbind(data.table(variable = variable, y_pred = y_pred), data_subset)
 }
 
 all_pred_list <- map(fits, \(fit) pmap_dfr(fit, make_pred_data))
