@@ -11,7 +11,7 @@ knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
 
 Here, I'm going to use the data from nearby weather stations that Zamir sent to try to fill in the larger gaps of the SCAN time series. The approach will be:
 
-- Fill in any small gaps of a few hours by linear interpolation for the continuous variables (temperature, wind speed, relative humidty, radiation, and soil moisture). Do not do this for precipitation because you cannot really interpolate as it is not really a "state" of the system.
+- Fill in any small gaps of a few hours by linear interpolation for the continuous variables (temperature, wind speed, relative humidity, radiation, and soil moisture). Do not do this for precipitation because you cannot really interpolate as it is not really a "state" of the system.
 - Make a statistical model, as simple as possible, to correlate the weather variables from the SCAN time series with the other locations, for the times when they are overlapping.
 - Use this statistical relationship to predict the SCAN values for the times when we do have data from one or more nearby stations but not the SCAN time series.
 
@@ -294,6 +294,8 @@ ggplot(all_daily_byTS, aes(x = SCAN, y = `AMF RC2`)) +
 # Predictive model
 
 Now let's make predictive models for each weather variable to fill gaps in the time series. We will train a random forest model on the portion of the dataset where the SCAN and the other data series overlap. We will use 10-fold cross-validation approach to find the model with the best predictive power for the overlapping sections. Finally we will apply that model to fill the gaps, predicting the time points when there are no SCAN values but there are values from the other time series.
+
+*note*: This portion of the code was run on SciNet.
 
 Start by joining the raw (non-summarized) data by date and time for each of the four time series. 
 
