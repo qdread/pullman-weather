@@ -15,6 +15,8 @@ Here, I'm going to use the data from nearby weather stations that Zamir sent to 
 - Train random forest models to correlate the weather variables from the SCAN time series with one or more of the other locations, for the times when they are overlapping.
 - Compare the models for each variable to show which locations are the best predictors for the overlapping portion, selecting the best one.
 - Use the best model to predict the SCAN values for the times when we do have data from one or more nearby stations but not the SCAN time series.
+- If the best model is not available for a time period, use the second best model.
+- If no models are available for a time period, use an *ad hoc* imputation method based on calculating the rolling average from the five-hour period centered on the missing time point, across all years, then adding simulated noise to it. (This is needed for a period of time in 2019-2020 when we have no sensor data.)
 
 # Fill in the shorter gaps for variables other than precipitation
 
@@ -447,9 +449,9 @@ Now let's put together the raw data with the data imputed from the random forest
 
 We have to do some "wrangling" to fill the data gaps with the predicted values from the random forest model. Use the AWN model for temperature and humidity for all time gaps, the all-predictors model for wind speed, radiation, and precipitation for the older time gap, and the AWN model for all for the newer time gaps where the all-predictors model does not have predicted values. Also there are some small gaps in the all-predictors model for wind speed for 2015 and 2016 which we can fill with the AWN model.
 
-This gets us to a pretty good place where we have everything filled in up to the gap from 2019-2020 where there are no 
+This gets us to a pretty good place where we have everything filled in up to the gap from 2019-2020 where there are no auxiliary time series. 
 
-```{r}
+```{r, eval = FALSE}
 load('project/weather_data/4ts_intermediate.RData') # loads time series.
 rf_all_pred <- fread('project/weather_data/rf_all_pred.csv')
 
@@ -475,7 +477,7 @@ This is what we need to do to fill in the 2019-2020 gap.
 
 First take the doubly-rolling long-run average over all years within +/- 2 days from each day, using either the observed data for that day-hour combination or the values imputed by the "short gap" filling method if applicable.
 
-```{r}
+```{r,eval = FALSE}
 get_fiveday_mean <- function(Date, Time, ...) {
   days_use <- Date + -2:2
   m_d_t_use <- data.table(Month = month(days_use), Day = day(days_use), Time = Time)
@@ -551,15 +553,109 @@ fiveday_precip <- pmap_dbl(scan_ts, random_precip_value)
 Fill in all remaining missing values with the imputed values.
 
 ```{r, eval = FALSE}
-fiveday_means_combined <- cbind(fiveday_means_withnoise, PRCP_in = fiveday_precip)
-for (v in obs_vars) {
-  scan_filled[[v]] <- ifelse(is.na(scan_filled[[v]]), fiveday_means_combined[[v]], scan_filled[[v]])
-}
+fiveday_means_combined <- cbind(scan_ts[, .(Date, Month, Day, Time)], fiveday_means_withnoise, PRCP_in = fiveday_precip)
+fiveday_means_combined_long <- melt(fiveday_means_combined, id.vars = id_vars, value.name = 'SCAN_imputed_adhoc')
 
+scan_filled[fiveday_means_combined_long, on = .NATURAL, SCAN_imputed_adhoc := i.SCAN_imputed_adhoc]
+
+scan_filled[is.na(SCAN_filled), SCAN_filled := SCAN_imputed_adhoc]
 ```
+
+Make a flag column showing what kind of imputation was done.
+
+```{r, eval = FALSE}
+scan_filled[, imputed := fcase(
+  !is.na(SCAN), 'none',
+  is.na(SCAN) & (!is.na(SCAN_pred_AWN) | !is.na(SCAN_pred_all)), 'nearby stations',
+  is.na(SCAN) & is.na(SCAN_pred_AWN) & is.na(SCAN_pred_all), 'ad hoc method'
+)]
+```
+
+Save the result.
+
+```{r, eval = FALSE}
+fwrite(scan_filled, 'project/weather_data/weather_data_all_imputed.csv')
+```
+
 
 # Plot the results
 
-Plot the time series colored by the source of the data. Blue is the actual data from the SCAN time series (not imputed), green is data imputed for very short gaps using linear interpolation (good quality imputation), pink is data imputed with nearby weather stations (good quality imputation), and orange is data imputed with my *ad hoc* method where no nearby weather stations were available (probably poor quality imputation).
+Plot the time series colored by the source of the data. Green is the actual data from the SCAN time series (not imputed or imputed with linear interpolation, not shown as a separate color), blue is data imputed with nearby weather stations (good quality imputation), and red is data imputed with my *ad hoc* method where no nearby weather stations were available (probably poor quality imputation).
 
 In my opinion it all passes the eyeball test.
+
+```{r, echo = FALSE}
+dat <- fread('project/weather_data/weather_data_all_imputed.csv')
+dat[, Time := str_pad(paste0(Time, ':00'), width = 5, pad = '0')]
+dat[, datetime := as_datetime(paste(Date, Time), format = "%Y-%m-%d %H:%M", tz = "America/Chicago")]
+
+
+wateryear_shading <- data.frame(d_min = as_datetime(c('2013-10-01 00:01', '2015-10-01 00:01', '2017-10-01 00:01', '2019-10-01 00:01'), format = "%Y-%m-%d %H:%M", tz = "America/Chicago"),
+                                d_max = as_datetime(c('2014-09-30 23:59', '2016-09-30 23:59', '2018-09-30 23:59', '2020-09-30 23:59'), format = "%Y-%m-%d %H:%M", tz = "America/Chicago"))
+
+ggplot(dat[variable == 'T_degC']) +
+  geom_rect(data = wateryear_shading, aes(xmin = d_min, xmax = d_max, ymin = -Inf, ymax = Inf), fill = 'gray75') +
+  geom_point(aes(x = datetime, y = SCAN_filled, color = imputed), size = 0.5, alpha = 0.5) +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), legend.position = 'none') +
+  scale_color_brewer(palette = 'Set1') + 
+  ggtitle('Temperature')
+
+ggplot(dat[variable == 'WS_mph']) +
+  geom_rect(data = wateryear_shading, aes(xmin = d_min, xmax = d_max, ymin = -Inf, ymax = Inf), fill = 'gray75') +
+  geom_point(aes(x = datetime, y = SCAN_filled, color = imputed), size = 0.5, alpha = 0.5) +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), legend.position = 'none') +
+  scale_color_brewer(palette = 'Set1') + 
+  ggtitle('Wind speed')
+
+ggplot(dat[variable == 'RH_pct']) +
+  geom_rect(data = wateryear_shading, aes(xmin = d_min, xmax = d_max, ymin = -Inf, ymax = Inf), fill = 'gray75') +
+  geom_point(aes(x = datetime, y = SCAN_filled, color = imputed), size = 0.5, alpha = 0.5) +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), legend.position = 'none') +
+  scale_color_brewer(palette = 'Set1') + 
+  ggtitle('Relative humidity')
+
+ggplot(dat[variable == 'SR_in_Wm2']) +
+  geom_rect(data = wateryear_shading, aes(xmin = d_min, xmax = d_max, ymin = -Inf, ymax = Inf), fill = 'gray75') +
+  geom_point(aes(x = datetime, y = SCAN_filled, color = imputed), size = 0.5, alpha = 0.5) +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), legend.position = 'none') +
+  scale_color_brewer(palette = 'Set1') + 
+  ggtitle('Incoming shortwave radiation')
+
+ggplot(dat[variable == 'PRCP_in']) +
+  geom_rect(data = wateryear_shading, aes(xmin = d_min, xmax = d_max, ymin = -Inf, ymax = Inf), fill = 'gray75') +
+  geom_point(aes(x = datetime, y = SCAN_filled, color = imputed), size = 0.5, alpha = 0.5) +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), legend.position = 'none') +
+  scale_color_brewer(palette = 'Set1') + 
+  ggtitle('Precipitation')
+```
+
+
+# Format the results for the DHSVM model
+
+Reshape the filled data to long form.
+
+```{r, eval = FALSE}
+scan_filled_wide <- dcast(scan_filled, Date + Time ~ variable, value.var = 'SCAN_filled')
+```
+
+
+Calculate the longwave radiation column using the Stefan-Boltzmann law, `j = emissivity * sigma * (temp_C + 273.15)^4`, where `emissivity` is set at `0.9` (unitless), and `sigma` is the Stefan-Boltzmann constant `5.670374e-8 W m-2 K-4`.
+
+```{r, eval = FALSE}
+sigma <- 5.670374e-8
+emissivity <- 0.9
+scan_filled_wide[, `SR_out_Wm2` := round(emissivity * sigma * (T_degC + 273.15)^4, 2)]
+```
+
+Also write file in the DHSVM format. Order columns as required by the format, and remove headers.  Convert windspeed units from mi/h to m/s, and precip units from in/h to m/h.
+
+```{r, eval = FALSE}
+datetime_formatted <- with(scan_filled_wide, paste(format(Date, '%m/%d/%Y'), Time, sep = '-'))
+cols_order <- c("T_degC", "WS_mph", "RH_pct", "SR_in_Wm2", "SR_out_Wm2", "PRCP_in")
+dhsvm_data <- data.table(DateTime = datetime_formatted, scan_filled_wide[, ..cols_order])
+
+dhsvm_data[, PRCP_in := PRCP_in * 0.0254]
+dhsvm_data[, WS_mph := WS_mph * 0.44704]
+
+fwrite(dhsvm_data, 'project/weather_data/dhsvm_forcing_imputed.txt', sep = ' ', quote = FALSE, col.names = FALSE)
+```
