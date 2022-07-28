@@ -1,6 +1,7 @@
 # PULLMAN WEATHER DATA INTERPOLATION
 # Fit random forest models to SCAN versus all other time series. Use 10-fold CV. 
 # Predict out the results.
+# Edit 2022-07-28: Job array with different predictor set for each array job (each one has 5 cores)
 
 library(data.table)
 library(purrr)
@@ -8,7 +9,10 @@ library(furrr)
 library(caret)
 library(Rutilitybelt)
 
-plan(multicore(workers = 5))
+plan(multicore(workers = as.numeric(Sys.getenv('SLURM_NTASKS'))))
+task <- as.numeric(Sys.getenv('SLURM_ARRAY_TASK_ID'))
+pred_name <- c('AWN', 'AMFRC1', 'AMFRC2', 'all')[task]
+pred_list <- list('AWN', 'AMFRC1', 'AMFRC2', c('AWN', 'AMFRC1', 'AMFRC2'))[[task]]
 
 load('project/weather_data/4ts_intermediate.RData') # loads time series.
 
@@ -54,21 +58,10 @@ fit_rf <- function(variable, data, lower_bound, upper_bound, predictors, ...) {
   )
 }
 
-# Apply the functions!!!
-rf_fits[, fit_AWN := future_pmap(rf_fits, fit_rf, predictors = 'AWN')]
-rf_fits[, fit_AMFRC1 := future_pmap(rf_fits, fit_rf, predictors = 'AMFRC1')]
-rf_fits[, fit_AMFRC2 := future_pmap(rf_fits, fit_rf, predictors = 'AMFRC2')]
-rf_fits[, fit_all := future_pmap(rf_fits, fit_rf, predictors = c('AWN', 'AMFRC1', 'AMFRC2'))]
-
-rf_fits[, predict_AWN_insample := map(fit_AWN, predict)]
-rf_fits[, predict_AMFRC1_insample := map(fit_AMFRC1, predict)]
-rf_fits[, predict_AMFRC2_insample := map(fit_AMFRC2, predict)]
-rf_fits[, predict_all_insample := map(fit_all, predict)]
-
-rf_fits[, predict_AWN_outsample := map2(fit_AWN, data, ~ predict(.x, newdata = .y))]
-rf_fits[, predict_AMFRC1_outsample := map2(fit_AMFRC1, data, ~ predict(.x, newdata = .y))]
-rf_fits[, predict_AMFRC2_outsample := map2(fit_AMFRC2, data, ~ predict(.x, newdata = .y))]
-rf_fits[, predict_all_outsample := map2(fit_all, data, ~ predict(.x, newdata = .y))]
+# Apply the function with the predictor(s) for this array task
+rf_fits[, fit := future_pmap(rf_fits, fit_rf, predictors = pred_list)]
+rf_fits[, predict_insample := map(fit, predict)]
+rf_fits[, predict_outsample := map2(fit, data, ~ predict(.x, newdata = .y))]
 
 # Additional post-processing can be done locally later.
-saveRDS(rf_fits, file = 'project/weather_data/all_rf_fits.rds')
+saveRDS(rf_fits, file = paste0('project/weather_data/rf_fits', pred_name, '.rds'))
